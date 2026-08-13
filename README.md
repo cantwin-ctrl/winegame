@@ -18,7 +18,7 @@ Cracked game folders, itch.io games, old Windows apps — they all want their ow
 # Debian/Ubuntu:  sudo apt install gamemode
 
 cp winegame ~/.local/bin/          # or anywhere on your PATH
-winegame doctor                    # verify everything's in place
+winegame doctor [name]              verify tooling; with a name: scan a game for missing runtimes
 ```
 
 ## Usage
