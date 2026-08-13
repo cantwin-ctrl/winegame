@@ -75,8 +75,9 @@ winegame --install-completion   # adds tab completion for bash or zsh
 
 ## Requirements
 
-- bash 4+
+- bash 4+ (every Linux distro ships 5)
 - wine (any modern version)
+- binutils (for objdump — used by `doctor <name>` import scanning)
 - winetricks (optional but very useful)
 - rsync (optional — installs fall back to `cp`)
 - gamemode (optional — powers the `-g` flag)
