@@ -16,7 +16,8 @@
 #   winegame log <name> [-f]               show/tail last run log
 #   winegame list                          list all game prefixes
 #   winegame remove <name> [-y]            delete a prefix
-#   winegame doctor                        check wine/winetricks tooling
+#   winegame doctor                       check wine/winetricks tooling
+#   winegame doctor <name>                 scan a game for missing runtimes, offer fixes
 #
 # Layout per game:  $PREFIX_ROOT/<name>/prefix   (the WINEPREFIX)
 #                   $PREFIX_ROOT/<name>/game     (drop your game files here)
@@ -412,6 +413,138 @@ cmd_doctor() {
   [[ $ok -eq 1 ]] && msg "tooling looks good." || warn "install missing tools: sudo apt install wine winetricks"
 }
 
+# DLLs wine ships as builtins / standard system libs — not worth flagging
+WHITELIST_DLLS="advapi32 comctl32 comdlg32 crypt32 d3d10 d3d10_1 d3d10core d3d10level9 d3d11 d3d12 d3d8 d3d9 ddraw dnsapi dsound dwmapi gdi32 gdiplus glu32 imm32 iphlpapi kernel32 mpr msimg32 msvcrt msvcrt20 msvcrt40 netapi32 ntdll odbc32 ole32 oleaut32 opengl32 powrprof psapi rasapi32 rpcrt4 secur32 sensapi setupapi shell32 shlwapi user32 userenv uxtheme version wined3d winhttp wininet winmm winspool wintrust ws2_32 wsock32 wtsapi32"
+
+# map a missing DLL to the winetricks verb that provides it (lowercased input)
+verb_for_dll() {
+  case "$(tr 'A-Z' 'a-z' <<< "$1")" in
+    msvcp140.dll|vcruntime140.dll|vcruntime140_1.dll|concrt140.dll) echo vcrun2022 ;;
+    msvcp120.dll|msvcr120.dll) echo vcrun2013 ;;
+    msvcp110.dll|msvcr110.dll) echo vcrun2012 ;;
+    msvcp100.dll|msvcr100.dll) echo vcrun2010 ;;
+    msvcp90.dll|msvcr90.dll) echo vcrun2008 ;;
+    msvcp80.dll|msvcr80.dll) echo vcrun2005 ;;
+    msvcp71.dll|msvcr71.dll) echo vcrun2003 ;;
+    d3dx9_*.dll) echo d3dx9 ;;
+    d3dx10*.dll) echo d3dx10 ;;
+    d3dx11_*.dll) echo d3dx11_43 ;;
+    d3dcompiler_43.dll) echo d3dcompiler_43 ;;
+    d3dcompiler_46.dll) echo d3dcompiler_46 ;;
+    d3dcompiler_47.dll) echo d3dcompiler_47 ;;
+    xinput1_*.dll|xinput9_1_0.dll) echo xinput ;;
+    xactengine*.dll|xaudio2_*.dll|x3daudio*.dll) echo xact ;;
+    physxloader.dll|physx3*.dll) echo physx ;;
+    openal32.dll|openal.dll) echo openal ;;
+    mscoree.dll|coreclr.dll) echo dotnet48 ;;
+    mfplat.dll|mf.dll|mfreadwrite.dll|mfplay.dll|mfsvr.dll) echo mf ;;
+    *) return 1 ;;
+  esac
+}
+
+# per-game runtime doctor: scan exe imports, flag missing DLLs, offer winetricks fixes
+# second arg --report = scan only, no prompts (used for the post-install rescan)
+game_doctor() {
+  local name="${1:-}" report=0
+  [[ "${2:-}" == "--report" ]] && report=1
+  require_game "$name"
+  local gdir; gdir="$(game_dir "$name")/game"
+  local -a exes=()
+  while IFS= read -r -d '' f; do exes+=("$f"); done < <(find "$gdir" -maxdepth 2 -iname '*.exe' -print0 2>/dev/null || true)
+  if [[ ${#exes[@]} -eq 0 ]]; then
+    msg "no .exe found in $gdir — install the game first (winegame install $name <folder>)"
+    return 0
+  fi
+  if ! command -v objdump >/dev/null 2>&1; then
+    warn "objdump (binutils) not found — can't scan imports (sudo apt install binutils)"
+    return 1
+  fi
+  msg "scanning ${#exes[@]} executable(s) for missing runtimes..."
+
+  # case-insensitive presence sets: game dir + prefix system32/syswow64
+  local -A present=()
+  local f d
+  while IFS= read -r -d '' f; do present["$(basename "$f" | tr 'A-Z' 'a-z')"]=1; done < <(find "$gdir" -maxdepth 2 -type f -print0 2>/dev/null)
+  for d in "$(prefix_dir "$name")/drive_c/windows/system32" "$(prefix_dir "$name")/drive_c/windows/syswow64"; do
+    [[ -d "$d" ]] || continue
+    while IFS= read -r -d '' f; do present["$(basename "$f" | tr 'A-Z' 'a-z')"]=1; done < <(find "$d" -maxdepth 1 -type f -print0 2>/dev/null)
+  done
+
+  local -A missing=() verbs=()
+  local e dll verb
+  for e in "${exes[@]}"; do
+    while read -r dll; do
+      [[ -n "$dll" ]] || continue
+      dll="$(tr 'A-Z' 'a-z' <<< "$dll")"
+      [[ -n "${missing[$dll]:-}" || -n "${present[$dll]:-}" ]] && continue
+      case "$dll" in
+        api-ms-*|ext-ms-*) continue ;;
+      esac
+      grep -qw "$dll" <<< "$WHITELIST_DLLS" && continue
+      missing[$dll]=1
+      if verb="$(verb_for_dll "$dll")"; then
+        [[ -n "${verbs[$verb]:-}" ]] || verbs[$verb]=$dll
+      fi
+    done < <(objdump -p "$e" 2>/dev/null | grep -i 'DLL Name:' | awk '{print $3}')
+  done
+
+  if [[ ${#missing[@]} -eq 0 ]]; then
+    msg "no missing DLLs — every import resolves or ships with the game"
+    return 0
+  fi
+
+  msg "${#missing[@]} missing DLL(s):"
+  printf '%s\n' "${!missing[@]}" | sort | sed 's/^/  /'
+
+  if ! command -v winetricks >/dev/null 2>&1; then
+    warn "winetricks not installed — can't auto-fix (sudo apt install winetricks)"
+    return 1
+  fi
+
+  local -A valid=()
+  local v
+  while read -r v; do [[ -n "$v" ]] && valid[$v]=1; done < <(winetricks list-all 2>/dev/null | awk '{print $1}')
+
+  local -a installable=()
+  for v in "${!verbs[@]}"; do
+    if [[ -n "${valid[$v]:-}" ]]; then installable+=("$v")
+    else warn "winetricks verb '$v' unavailable in this version — skipping"; fi
+  done
+
+  if [[ ${#installable[@]} -eq 0 ]]; then
+    msg "no known winetricks fix for the missing DLLs above (they may ship with the game/crack)"
+    return 1
+  fi
+
+  mapfile -t installable < <(printf '%s\n' "${installable[@]}" | sort)
+  msg "fixable via winetricks:"
+  local vv
+  for vv in "${installable[@]}"; do printf '  %-14s (needs %s)\n' "$vv" "${verbs[$vv]}"; done
+
+  if [[ $report -eq 1 ]]; then return 1; fi
+  local ans=n
+  if [[ -t 0 ]]; then
+    read -rp "install ${#installable[@]} runtime(s) now? [y/N] " ans
+  fi
+  if [[ "$ans" != y && "$ans" != Y ]]; then
+    msg "skipped — run again later: winegame doctor $name"
+    return 1
+  fi
+
+  load_env "$name"
+  export WINEPREFIX="$(prefix_dir "$name")"
+  local done_any=0
+  for vv in "${installable[@]}"; do
+    msg "installing $vv ..."
+    if winetricks -q "$vv" >/dev/null 2>&1; then msg "  $vv done"; done_any=1
+    else warn "  $vv failed"; fi
+  done
+  if [[ $done_any -eq 1 ]]; then
+    msg "re-scanning..."
+    game_doctor "$name" --report
+  fi
+}
+
 cmd_list_names() { # internal: bare game names for completion
   [[ -d "$PREFIX_ROOT" ]] || return 0
   for d in "$PREFIX_ROOT"/*/; do
@@ -486,6 +619,7 @@ ${C_B}commands:${C_X}
   list                        list prefixes
   remove <name> [-y]          delete a prefix (asks unless -y)
   doctor                      check wine/winetricks tooling
+  doctor <name>               scan a game for missing runtimes, offer winetricks fixes
 
 ${C_B}layout:${C_X}  $PREFIX_ROOT/<name>/{prefix,game,env,logs}
 ${C_B}config:${C_X}  set WINE_GAMES_DIR to relocate prefixes
@@ -494,12 +628,19 @@ EOF
 }
 
 # --- dispatch ----------------------------------------------------------------
-case "${1:-}" in
-  ""|-h|--help|help) usage ;;
-  --version|-V) echo "winegame $VERSION" ;;
-  --commands) printf '%s\n' "${COMMANDS[@]}" ;;
-  --list-names) cmd_list_names ;;
-  --install-completion) cmd_install_completion ;;
-  new|install|run|cfg|setver|tricks|list|remove|override|env|shell|log|wine|doctor) "cmd_$1" "${@:2}" ;;
-  *) die "unknown command '$1' (see: winegame --help)" ;;
-esac
+main() {
+  case "${1:-}" in
+    ""|-h|--help|help) usage ;;
+    --version|-V) echo "winegame $VERSION" ;;
+    --commands) printf '%s\n' "${COMMANDS[@]}" ;;
+    --list-names) cmd_list_names ;;
+    --install-completion) cmd_install_completion ;;
+    doctor)
+      if [[ -n "${2:-}" ]]; then game_doctor "$2"
+      else cmd_doctor; fi
+      ;;
+    new|install|run|cfg|setver|tricks|list|remove|override|env|shell|log|wine) "cmd_$1" "${@:2}" ;;
+    *) die "unknown command '$1' (see: winegame --help)" ;;
+  esac
+}
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi
