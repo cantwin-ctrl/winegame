@@ -38,7 +38,7 @@ winegame shell <name>                shell with prefix env loaded (escape hatch)
 winegame log <name> [-f]             show/tail latest run log
 winegame list                        list prefixes
 winegame remove <name> [-y]          delete a prefix (asks unless -y)
-winegame doctor                      check tooling; doctor <name> scans a game
+winegame doctor [name]                check tooling, or scan a game for missing runtimes
 ```
 
 ## Typical workflow
