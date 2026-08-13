@@ -1,0 +1,505 @@
+#!/usr/bin/env bash
+# winegame - per-game Wine prefix manager
+# One prefix per game under $PREFIX_ROOT/<name>/, with persistent env vars,
+# DLL overrides, per-run logs, winetricks/winecfg integration, and a shell escape hatch.
+#
+#   winegame new <name> [--win32]          create a new game prefix
+#   winegame install <name> <folder|exe>    copy a game folder into the prefix once
+#   winegame run <name> [exe] [args...]     run a game (auto-detects exe in game/)
+#   winegame setver <name> <ver>            set Windows version (win7|win10|win11|winxp)
+#   winegame cfg <name>                    open winecfg for the prefix
+#   winegame tricks <name> [pkgs...]       run winetricks (no args = GUI)
+#   winegame override <name> [dll=mode]... set DLL overrides (no args = show)
+#   winegame env <name> [KEY=VALUE]...     persistent env vars (no args = show)
+#   winegame wine <name> [args...]         run arbitrary wine command in prefix
+#   winegame shell <name>                  drop into a shell with the prefix env
+#   winegame log <name> [-f]               show/tail last run log
+#   winegame list                          list all game prefixes
+#   winegame remove <name> [-y]            delete a prefix
+#   winegame doctor                        check wine/winetricks tooling
+#
+# Layout per game:  $PREFIX_ROOT/<name>/prefix   (the WINEPREFIX)
+#                   $PREFIX_ROOT/<name>/game     (drop your game files here)
+#                   $PREFIX_ROOT/<name>/env      (persistent env, sourced)
+#                   $PREFIX_ROOT/<name>/logs/    (run logs)
+#
+# Override PREFIX_ROOT with $WINE_GAMES_DIR if you want it elsewhere.
+
+set -euo pipefail
+
+VERSION="1.1.0"
+PREFIX_ROOT="${WINE_GAMES_DIR:-$HOME/.games}"
+COMMANDS=(new install run cfg setver tricks override env wine shell log list remove doctor)
+
+# --- colors (off when piped or NO_COLOR) -------------------------------------
+if [[ -t 1 ]] && [[ -z "${NO_COLOR:-}" ]]; then
+  C_G=$'\e[32m'; C_Y=$'\e[33m'; C_R=$'\e[31m'; C_B=$'\e[1m'; C_D=$'\e[2m'; C_X=$'\e[0m'
+else
+  C_G=; C_Y=; C_R=; C_B=; C_D=; C_X=
+fi
+
+die()  { echo "${C_R}error:${C_X} $*" >&2; exit 1; }
+msg()  { echo "${C_G}==>${C_X} $*"; }
+warn() { echo "${C_Y}warn:${C_X} $*" >&2; }
+
+game_dir()  { echo "$PREFIX_ROOT/$1"; }
+prefix_dir(){ echo "$PREFIX_ROOT/$1/prefix"; }
+env_file()  { echo "$PREFIX_ROOT/$1/env"; }
+log_dir()   { echo "$PREFIX_ROOT/$1/logs"; }
+
+valid_name() { [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]] && [[ "$1" != "." ]] && [[ "$1" != ".." ]]; }
+
+require_game() {
+  [[ -n "${1:-}" ]] || die "missing game name"
+  [[ -d "$(prefix_dir "$1")" ]] || die "no such game '$1' (create it: winegame new $1)"
+}
+
+# source the env file — values are written by set_env with proper quoting,
+# same trust model as your own shell rc.
+load_env() {
+  local f; f="$(env_file "$1")"
+  [[ -f "$f" ]] && source "$f"
+}
+
+# read one key from an env file (subshell so nothing leaks)
+get_env_val() {
+  local f; f="$(env_file "$1")"
+  [[ -f "$f" ]] || return 0
+  ( source "$f"; printf '%s' "${!2:-}" )
+}
+
+# upsert KEY=VALUE into an env file (single-quote escaped)
+set_env() {
+  local file; file="$(env_file "$1")"; local key=$2 val=$3
+  [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "bad env key '$key'"
+  local tmp; tmp="$(mktemp)"
+  local found=0
+  if [[ -f "$file" ]]; then
+    while IFS= read -r line; do
+      if [[ "$line" == "$key="* ]]; then
+        printf "%s='%s'\n" "$key" "${val//\'/\'\\\'\'}" >> "$tmp"; found=1
+      else
+        printf '%s\n' "$line" >> "$tmp"
+      fi
+    done < "$file"
+  fi
+  [[ $found -eq 1 ]] || printf "%s='%s'\n" "$key" "${val//\'/\'\\\'\'}" >> "$tmp"
+  mv "$tmp" "$file"
+}
+
+del_env() { # remove a key entirely
+  local file; file="$(env_file "$1")"; local key=$2
+  [[ -f "$file" ]] || return 0
+  local tmp; tmp="$(mktemp)"
+  while IFS= read -r line; do
+    [[ "$line" == "$key="* ]] || printf '%s\n' "$line" >> "$tmp"
+  done < "$file"
+  mv "$tmp" "$file"
+}
+
+require_wine() {
+  command -v wine >/dev/null || die "wine not found — install it: sudo apt install wine winetricks (or your distro's package)"
+}
+
+# --- commands ----------------------------------------------------------------
+
+cmd_new() {
+  local name="${1:-}" arch=win64
+  shift || true
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --win32) arch=win32; shift ;;
+      --win64) arch=win64; shift ;;
+      *) die "unknown option '$1' (try --win32/--win64)" ;;
+    esac
+  done
+  [[ -n "$name" ]] || die "usage: winegame new <name> [--win32]"
+  valid_name "$name" || die "invalid name '$name' (alnum, dot, dash, underscore only)"
+  [[ -d "$(prefix_dir "$name")" ]] && die "game '$name' already exists"
+  mkdir -p "$(prefix_dir "$name")" "$(game_dir "$name")/game" "$(log_dir "$name")"
+  echo "WINEARCH=$arch" > "$(env_file "$name")"
+  msg "created $(game_dir "$name") (arch=$arch)"
+  if command -v wineboot >/dev/null; then
+    msg "initializing prefix (first wineboot is slow, that's normal)..."
+    set +e
+    load_env "$name"
+    export WINEPREFIX="$(prefix_dir "$name")"
+    wineboot -i >/dev/null 2>&1
+    local st=$?
+    set -e
+    [[ $st -eq 0 ]] || warn "wineboot exited $st — prefix may be incomplete; try 'winegame cfg $name'"
+  else
+    warn "wine not installed — prefix dir created but not initialized (run 'winegame doctor')"
+  fi
+  msg "put game files in $(game_dir "$name")/game/ then: winegame run $name"
+}
+
+cmd_run() {
+  local name="" gamemode=0 no_copy=0 verbose=0 exe=""
+  local -a args=()
+  # flags may come before or after the game name
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -g|--gamemode) gamemode=1; shift ;;
+      --no-copy) no_copy=1; shift ;;
+      -v|--verbose) verbose=1; shift ;;
+      --) shift; break ;;
+      -*) die "unknown option '$1' (run flags: -g/--gamemode, --no-copy, -v/--verbose)" ;;
+      *)
+        if [[ -z "$name" ]]; then name=$1; shift
+        else break; fi
+        ;;
+    esac
+  done
+  require_game "$name"
+  require_wine
+  if [[ $# -gt 0 ]]; then
+    if [[ "$1" == *.exe ]] || [[ -f "$1" ]] || [[ -f "$(game_dir "$name")/game/$1" ]]; then
+      exe=$1; shift
+    fi
+  fi
+  args=("$@")
+
+  if [[ -z "$exe" ]]; then
+    local dir; dir="$(game_dir "$name")/game"
+    local found=()
+    while IFS= read -r -d '' f; do found+=("$f"); done < <(find "$dir" -maxdepth 2 -iname '*.exe' -print0 2>/dev/null || true)
+    case ${#found[@]} in
+      0) die "no .exe in $dir — pass one: winegame run $name /path/to/game.exe" ;;
+      1) exe=${found[0]} ;;
+      *)
+        echo "multiple executables found:"
+        for i in "${!found[@]}"; do printf '%2d) %s\n' "$((i+1))" "${found[$i]#$dir/}"; done
+        read -rp "pick [1-${#found[@]}]: " choice
+        [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#found[@]} )) || die "bad choice"
+        exe=${found[$((choice-1))]}
+        ;;
+    esac
+  else
+    # resolve relative exe paths against game/, game dir, then cwd
+    if [[ "$exe" != /* ]]; then
+      if [[ -f "$(game_dir "$name")/game/$exe" ]]; then exe="$(game_dir "$name")/game/$exe"
+      elif [[ -f "$(game_dir "$name")/$exe" ]]; then exe="$(game_dir "$name")/$exe"
+      elif [[ -f "$PWD/$exe" ]]; then exe="$PWD/$exe"
+      fi
+    fi
+    [[ -f "$exe" ]] || die "no such exe: $exe"
+  fi
+
+  # external path → offer to copy it into the prefix once, then it's just 'winegame run <name>'
+  if [[ "$exe" != "$(game_dir "$name")/game/"* ]]; then
+    local src_dir; src_dir="$(dirname "$exe")"
+    if [[ $no_copy -eq 0 ]]; then
+      local ans=n
+      if [[ -t 0 ]]; then
+        read -rp "copy '$src_dir' into $(game_dir "$name")/game/? [y/N] " ans
+      fi
+      if [[ "$ans" == y || "$ans" == Y ]]; then
+        cmd_install "$name" "$src_dir"
+        exe="$(game_dir "$name")/game/$(basename "$src_dir")/$(basename "$exe")"
+      fi
+    fi
+  fi
+
+  load_env "$name"
+  export WINEPREFIX="$(prefix_dir "$name")"
+  [[ $verbose -eq 1 ]] || export WINEDEBUG="${WINEDEBUG:--all}"
+  local -a runner=()
+  if [[ $gamemode -eq 1 ]]; then
+    if command -v gamemoderun >/dev/null 2>&1; then
+      runner=(gamemoderun)
+    else
+      warn "gamemode not installed (apt install gamemode) — running without it"
+    fi
+  fi
+  mkdir -p "$(log_dir "$name")"
+  local log; log="$(log_dir "$name")/$(date +%Y%m%d-%H%M%S).log"
+  msg "running ${exe#$PREFIX_ROOT/} ${args[*]:-}"
+  msg "log: $log"
+  cd "$(dirname "$exe")"
+  set +e
+  "${runner[@]}" wine "./$(basename "$exe")" "${args[@]}" 2>&1 | tee "$log"
+  local st=${PIPESTATUS[0]}
+  set -e
+  if [[ $st -ne 0 ]]; then
+    warn "wine exited with $st (last run log: $log)"
+    return $st
+  fi
+}
+
+cmd_install() {
+  local name="${1:-}" src="${2:-}"
+  [[ -n "$name" && -n "$src" ]] || die "usage: winegame install <name> <game-folder-or-exe>"
+  require_game "$name"
+  [[ -e "$src" ]] || die "no such path: $src"
+  local src_dir="$src"
+  [[ -d "$src" ]] || src_dir="$(dirname "$src")"
+  src_dir="$(cd "$src_dir" && pwd)"
+  local target; target="$(game_dir "$name")/game/$(basename "$src_dir")"
+  [[ -e "$target" ]] && die "already installed at $target"
+  mkdir -p "$(dirname "$target")"
+  msg "copying $src_dir → $target ..."
+  if command -v rsync >/dev/null 2>&1; then
+    rsync -a --info=progress2 "$src_dir/" "$target/"
+  else
+    cp -r "$src_dir" "$target"
+  fi
+  msg "installed. now just: winegame run $name"
+}
+
+cmd_setver() {
+  local name="${1:-}" ver="${2:-}"
+  require_game "$name"
+  require_wine
+  case "$ver" in
+    win7|win10|win11|winxp) ;;
+    *) die "usage: winegame setver <name> <win7|win10|win11|winxp>" ;;
+  esac
+  load_env "$name"
+  export WINEPREFIX="$(prefix_dir "$name")"
+  winecfg -v "$ver" >/dev/null 2>&1 || die "winecfg -v $ver failed"
+  msg "$name prefix now reports $ver"
+}
+
+cmd_cfg() {
+  require_game "${1:-}"
+  require_wine
+  load_env "$1"
+  export WINEPREFIX="$(prefix_dir "$1")"
+  exec winecfg "${@:2}"
+}
+
+cmd_tricks() {
+  local name="${1:-}"; shift || true
+  require_game "$name"
+  command -v winetricks >/dev/null || die "winetricks not found — install it: sudo apt install winetricks"
+  load_env "$name"
+  export WINEPREFIX="$(prefix_dir "$name")"
+  if [[ $# -eq 0 ]]; then
+    msg "no packages given — opening winetricks GUI"
+    exec winetricks --gui
+  fi
+  msg "winetricks $*"
+  exec winetricks "$@"
+}
+
+cmd_override() {
+  local name="${1:-}"; shift || true
+  require_game "$name"
+  if [[ $# -eq 0 ]]; then
+    local cur; cur="$(get_env_val "$name" WINEDLLOVERRIDES)"
+    if [[ -n "$cur" ]]; then msg "current overrides: $cur"
+    else msg "no overrides set (e.g.: winegame override $name dinput8=n,b)"; fi
+    return 0
+  fi
+  local cur; cur="$(get_env_val "$name" WINEDLLOVERRIDES)"
+  IFS=';' read -ra existing <<< "$cur"
+  local -a keep=()
+  for e in "${existing[@]}"; do
+    [[ -z "$e" ]] && continue
+    local dll="${e%%=*}"
+    local dup=0
+    for n in "$@"; do [[ "${n%%=*}" == "$dll" ]] && dup=1; done
+    [[ $dup -eq 0 ]] && keep+=("$e")
+  done
+  local -a merged=("${keep[@]}" "$@")
+  local joined; joined="$(IFS=';'; echo "${merged[*]}")"
+  set_env "$name" WINEDLLOVERRIDES "$joined"
+  msg "overrides: $joined"
+}
+
+cmd_env() {
+  local name="${1:-}"; shift || true
+  require_game "$name"
+  if [[ $# -eq 0 ]]; then
+    local f; f="$(env_file "$name")"
+    [[ -f "$f" ]] || { msg "no env set"; return 0; }
+    msg "env for $name:"
+    while IFS= read -r line; do
+      [[ -z "$line" || "$line" == \#* ]] && continue
+      echo "  $line"
+    done < "$f"
+    return 0
+  fi
+  for kv in "$@"; do
+    local key="${kv%%=*}" val
+    [[ "$kv" == *=* ]] || die "expected KEY=VALUE, got '$kv'"
+    val="${kv#*=}"
+    if [[ -z "$val" ]]; then
+      del_env "$name" "$key"
+      msg "unset $key"
+    else
+      set_env "$name" "$key" "$val"
+      msg "set $key='$val'"
+    fi
+  done
+}
+
+cmd_wine() {
+  local name="${1:-}"; shift || true
+  require_game "$name"
+  require_wine
+  load_env "$name"
+  export WINEPREFIX="$(prefix_dir "$name")"
+  exec wine "$@"
+}
+
+cmd_shell() {
+  require_game "${1:-}"
+  load_env "$1"
+  export WINEPREFIX="$(prefix_dir "$1")"
+  [[ -d "$(game_dir "$1")/game" ]] && cd "$(game_dir "$1")/game"
+  msg "prefix shell for $1 (WINEPREFIX=$WINEPREFIX) — exit to leave"
+  exec "${SHELL:-bash}"
+}
+
+cmd_log() {
+  local name="${1:-}"; shift || true
+  require_game "$name"
+  local log; log="$(ls -t "$(log_dir "$name")"/*.log 2>/dev/null | head -1 || true)"
+  [[ -n "$log" ]] || die "no logs yet for $name"
+  if [[ "${1:-}" == "-f" || "${1:-}" == "--follow" ]]; then
+    exec tail -f "$log"
+  fi
+  exec tail -n 100 "$log"
+}
+
+cmd_list() {
+  [[ -d "$PREFIX_ROOT" ]] || { msg "no games yet ($PREFIX_ROOT) — winegame new <name>"; return 0; }
+  local any=0
+  for d in "$PREFIX_ROOT"/*/; do
+    [[ -d "$d/prefix" ]] || continue
+    any=1
+    local name; name="$(basename "$d")"
+    local arch; arch="$(get_env_val "$name" WINEARCH)"
+    local size; size="$(du -sh "$d/prefix" 2>/dev/null | cut -f1)"
+    printf '  %-24s %-7s %s\n' "$name" "${arch:-win64}" "${size:-?}"
+  done
+  [[ $any -eq 1 ]] || msg "no games yet ($PREFIX_ROOT) — winegame new <name>"
+}
+
+cmd_remove() {
+  local name="${1:-}"; shift || true
+  require_game "$name"
+  local force=0
+  [[ "${1:-}" == "-y" || "${1:-}" == "--yes" ]] && force=1
+  if [[ $force -eq 0 ]]; then
+    read -rp "delete '$name' and its whole prefix? [y/N] " ans
+    [[ "$ans" == y || "$ans" == Y ]] || { msg "aborted"; return 0; }
+  fi
+  rm -rf "$(game_dir "$name")"
+  msg "removed $name"
+}
+
+cmd_doctor() {
+  msg "winegame $VERSION — prefix root: $PREFIX_ROOT"
+  local ok=1
+  for t in wine wineboot winecfg winepath winetricks; do
+    if command -v "$t" >/dev/null; then
+      local v; v="$("$t" --version 2>/dev/null | head -1 || true)"
+      msg "  $t: ${v:-found}"
+    else
+      warn "  $t: NOT FOUND"; ok=0
+    fi
+  done
+  if command -v gamemoderun >/dev/null 2>&1; then msg "  gamemode: found"
+  else warn "  gamemode: NOT FOUND (optional — apt install gamemode)"; fi
+  if command -v rsync >/dev/null 2>&1; then msg "  rsync: found (fast installs)"
+  else warn "  rsync: NOT FOUND (installs fall back to cp)"; fi
+  local n=0
+  [[ -d "$PREFIX_ROOT" ]] && n="$(cmd_list | grep -c . || true)"
+  msg "  games: $n"
+  [[ $ok -eq 1 ]] && msg "tooling looks good." || warn "install missing tools: sudo apt install wine winetricks"
+}
+
+cmd_list_names() { # internal: bare game names for completion
+  [[ -d "$PREFIX_ROOT" ]] || return 0
+  for d in "$PREFIX_ROOT"/*/; do
+    [[ -d "$d/prefix" ]] && basename "$d"
+  done
+}
+
+cmd_install_completion() {
+  local rc
+  case "${SHELL##*/}" in
+    zsh)  rc="$HOME/.zshrc" ;;
+    bash) rc="$HOME/.bashrc" ;;
+    *) die "unsupported shell '${SHELL##*/}' — add completion manually" ;;
+  esac
+  local marker="# winegame completion (managed block — safe to delete)"
+  if grep -qF "$marker" "$rc" 2>/dev/null; then warn "completion already installed in $rc"; return 0; fi
+  {
+    echo ""
+    echo "$marker"
+    echo 'if command -v winegame >/dev/null 2>&1; then'
+    if [[ "${SHELL##*/}" == zsh ]]; then
+      cat <<'EOF'
+_winegame() {
+  local -a cmds games
+  cmds=(${(f)"$(winegame --commands 2>/dev/null)"})
+  if (( CURRENT == 2 )); then
+    _describe 'command' cmds
+  elif (( CURRENT == 3 )); then
+    games=(${(f)"$(winegame --list-names 2>/dev/null)"})
+    _describe 'game' games
+  fi
+}
+compdef _winegame winegame
+EOF
+    else
+      cat <<'EOF'
+_winegame_complete() {
+  local cur="${COMP_WORDS[COMP_CUR]}"
+  if [[ ${COMP_CWORD} -eq 1 ]]; then
+    COMPREPLY=( $(compgen -W "$(winegame --commands)" -- "$cur") )
+  else
+    COMPREPLY=( $(compgen -W "$(winegame --list-names)" -- "$cur") )
+  fi
+}
+complete -F _winegame_complete winegame
+EOF
+    fi
+    echo 'fi'
+  } >> "$rc"
+  msg "completion installed in $rc — restart shell or 'source $rc' to activate"
+}
+
+usage() {
+  cat <<EOF
+${C_B}winegame $VERSION${C_X} — per-game Wine prefix manager
+
+${C_B}usage:${C_X} winegame <command> [args...]
+
+${C_B}commands:${C_X}
+  new <name> [--win32]        create a prefix (--win32 for 32-bit only games)
+  install <name> <folder|exe> copy a game folder into the prefix once
+  run <name> [exe] [args...]  run a game; exe auto-detected in <name>/game/
+                              flags: -g/--gamemode, --no-copy, -v/--verbose
+  cfg <name>                  open winecfg (DLL overrides, display, etc.)
+  setver <name> <ver>         set Windows version (win7|win10|win11|winxp)
+  tricks <name> [pkgs...]     winetricks; no packages = GUI (e.g. vcrun2019 -q)
+  override <name> [dll=mode]  set DLL overrides (dinput8=n,b); no args = show
+  env <name> [KEY=VALUE]...   persistent env for the prefix; no args = show
+  wine <name> [args...]       raw wine passthrough in the prefix
+  shell <name>                shell with prefix env loaded (escape hatch)
+  log <name> [-f]             show/tail latest run log
+  list                        list prefixes
+  remove <name> [-y]          delete a prefix (asks unless -y)
+  doctor                      check wine/winetricks tooling
+
+${C_B}layout:${C_X}  $PREFIX_ROOT/<name>/{prefix,game,env,logs}
+${C_B}config:${C_X}  set WINE_GAMES_DIR to relocate prefixes
+${C_B}extra:${C_X}   winegame --install-completion | --commands | --list-names
+EOF
+}
+
+# --- dispatch ----------------------------------------------------------------
+case "${1:-}" in
+  ""|-h|--help|help) usage ;;
+  --version|-V) echo "winegame $VERSION" ;;
+  --commands) printf '%s\n' "${COMMANDS[@]}" ;;
+  --list-names) cmd_list_names ;;
+  --install-completion) cmd_install_completion ;;
+  new|install|run|cfg|setver|tricks|list|remove|override|env|shell|log|wine|doctor) "cmd_$1" "${@:2}" ;;
+  *) die "unknown command '$1' (see: winegame --help)" ;;
+esac
