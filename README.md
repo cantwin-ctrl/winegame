@@ -19,7 +19,29 @@ Cracked game folders, itch.io games, old Windows apps — they all want their ow
 
 cp winegame ~/.local/bin/          # or anywhere on your PATH
 winegame doctor [name]              verify tooling; with a name: scan a game for missing runtimes
+winegame doctor fix                 one-shot: install WineHQ wine + fix video decode (see below)
 ```
+
+## Fixing the "blank screen on VN movies" class of bug
+
+Debian/Ubuntu ship a wine build whose builtin DirectShow decoders
+(`winegstreamer`) can **deadlock** when a game plays its OP/opening movie —
+the movie thread waits forever, the game hangs on a black/white window.
+
+```bash
+winegame doctor        # detects the bad wine build + missing VA-API driver
+winegame doctor fix    # installs WineHQ staging (replaces Debian wine) and sets
+                       # LIBVA_DRIVER_NAME per GPU (iHD on Intel, radeonsi on AMD)
+```
+
+`doctor fix` needs sudo once, then every prefix benefits. The driver env is set
+globally (`/etc/environment`) *and* per-game, and `winegame new` bakes it into
+every future prefix automatically. Games that already hang should be re-created
+fresh (`winegame new` + `install`) rather than patched — the old prefix carries
+whatever hacks you applied while debugging.
+
+Note: after switching wine versions, run each game once — the prefix
+auto-upgrades silently on first launch.
 
 ## Usage
 
@@ -38,7 +60,9 @@ winegame shell <name>                shell with prefix env loaded (escape hatch)
 winegame log <name> [-f]             show/tail latest run log
 winegame list                        list prefixes
 winegame remove <name> [-y]          delete a prefix (asks unless -y)
-winegame doctor [name]                check tooling, or scan a game for missing runtimes
+winegame doctor                      check wine/winetricks tooling + wine build + GPU video driver
+winegame doctor fix [name]           install WineHQ wine + right VA-API driver (fixes movie deadlock)
+winegame doctor <name>               scan a game for missing runtimes, offer winetricks fixes
 ```
 
 ## Typical workflow
@@ -61,9 +85,14 @@ game folder in — after that the exe is auto-detected and all you type is
 ~/.games/<name>/
 ├── prefix/    # the WINEPREFIX itself
 ├── game/      # your game files (installed here once)
-├── env        # persistent env vars, sourced before every run
+├── env        # persistent env vars, exported to the game process on every run
 └── logs/      # one timestamped log per run
 ```
+
+The `env` file is sourced and **exported** into the wine process before every
+launch — `LIBVA_DRIVER_NAME`, `WINEDLLOVERRIDES`, anything you put there
+actually reaches the game. `winegame new` pre-fills it with the right VA-API
+driver for your GPU.
 
 Set `WINE_GAMES_DIR` to relocate everything (e.g. another drive).
 
@@ -76,8 +105,10 @@ winegame --install-completion   # adds tab completion for bash or zsh
 ## Requirements
 
 - bash 4+ (every Linux distro ships 5)
-- wine (any modern version)
+- wine (any modern version; WineHQ staging recommended)
+- winetricks
 - binutils (for objdump — used by `doctor <name>` import scanning)
+- pciutils (for lspci — used by `doctor`/`doctor fix` GPU detection)
 - winetricks (optional but very useful)
 - rsync (optional — installs fall back to `cp`)
 - gamemode (optional — powers the `-g` flag)
