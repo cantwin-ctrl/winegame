@@ -28,7 +28,7 @@
 
 set -euo pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 PREFIX_ROOT="${WINE_GAMES_DIR:-$HOME/.games}"
 COMMANDS=(new install run cfg setver tricks override env wine shell log list remove doctor)
 
@@ -119,6 +119,12 @@ cmd_new() {
   [[ -d "$(prefix_dir "$name")" ]] && die "game '$name' already exists"
   mkdir -p "$(prefix_dir "$name")" "$(game_dir "$name")/game" "$(log_dir "$name")"
   echo "WINEARCH=$arch" > "$(env_file "$name")"
+  # movie-decode fix: carry the right VA-API driver into every new prefix unless
+  # it's already global (covers winegstreamer video on Intel Skylake+ / AMD)
+  local vd; vd="$(vaapi_driver)"
+  if [[ -n "$vd" ]] && [[ -z "${LIBVA_DRIVER_NAME:-}" ]] && ! grep -qs "^LIBVA_DRIVER_NAME=$vd" /etc/environment 2>/dev/null; then
+    set_env "$name" LIBVA_DRIVER_NAME "$vd"
+  fi
   msg "created $(game_dir "$name") (arch=$arch)"
   if command -v wineboot >/dev/null; then
     msg "initializing prefix (first wineboot is slow, that's normal)..."
@@ -410,7 +416,121 @@ cmd_doctor() {
   local n=0
   [[ -d "$PREFIX_ROOT" ]] && n="$(cmd_list | grep -c . || true)"
   msg "  games: $n"
+  local state; state="$(wine_build_state)"
+  case "$state" in
+    bad)     warn "  wine build: Debian repack — known winegstreamer movie deadlock (VNs hang on a blank screen)"; msg "  → run: winegame doctor fix" ;;
+    missing) warn "  wine: NOT INSTALLED — run: winegame doctor fix" ;;
+    good)    msg "  wine build: not the Debian repack — OK" ;;
+  esac
+  local gpu; gpu="$(gpu_vendor)"
+  msg "  GPU: $gpu"
+  local vd; vd="$(vaapi_driver)"
+  if [[ -n "$vd" ]]; then
+    if [[ -n "${LIBVA_DRIVER_NAME:-}" ]] || grep -qs "^LIBVA_DRIVER_NAME=$vd" /etc/environment 2>/dev/null; then
+      msg "  VA-API driver: $vd (hardware video decode OK)"
+    else
+      warn "  VA-API driver: unset → wrong fallback breaks video decode ($gpu)"
+      msg "  → run: winegame doctor fix"
+    fi
+  else
+    warn "  GPU ($gpu): no VA-API driver — videos need software decode (gstreamer1.0-libav:i386)"
+    msg "  → run: winegame doctor fix"
+  fi
   [[ $ok -eq 1 ]] && msg "tooling looks good." || warn "install missing tools: sudo apt install wine winetricks"
+}
+
+# wine build state: "bad" = Debian repack (broken winegstreamer movie path),
+# "good" = anything else (WineHQ/Staging/upstream), "missing" = no wine.
+wine_build_state() {
+  local v; v="$(wine --version 2>/dev/null | head -1 || true)"
+  [[ -z "$v" ]] && { echo missing; return; }
+  case "$v" in
+    *repack*|*" (Debian"*) echo bad ;;
+    *) echo good ;;
+  esac
+}
+
+# GPU vendor for VA-API driver selection (intel|amd|nvidia|unknown)
+gpu_vendor() {
+  command -v lspci >/dev/null 2>&1 || { echo unknown; return; }
+  local id; id="$(lspci 2>/dev/null | grep -iE 'vga|3d controller|display controller' | head -1)"
+  case "$id" in
+    *Intel*) echo intel ;;
+    *AMD*|*ATI*|*Radeon*) echo amd ;;
+    *NVIDIA*) echo nvidia ;;
+    *) echo unknown ;;
+  esac
+}
+
+# right LIBVA_DRIVER_NAME for this GPU ("" = no VA-API driver available)
+vaapi_driver() {
+  case "$(gpu_vendor)" in
+    intel) echo iHD ;;
+    amd) echo radeonsi ;;
+    *) echo "" ;;
+  esac
+}
+
+# doctor fix: swap the broken Debian wine for WineHQ staging and point VA-API
+# at the iHD driver. Fixes the winegstreamer movie deadlock + Skylake video
+# decode in one pass (tested: wine-11.15 staging + LIBVA_DRIVER_NAME=iHD).
+cmd_doctor_fix() {
+  local only="${1:-}"
+  local state; state="$(wine_build_state)"
+  case "$state" in
+    bad)
+      msg "your wine is the Debian build with the broken winegstreamer — installing WineHQ staging instead"
+      msg "this needs sudo and replaces the Debian wine package (prefixes auto-upgrade on next run)"
+      local ans=n
+      if [[ -t 0 ]]; then read -rp "continue? [y/N] " ans; fi
+      [[ "$ans" == y || "$ans" == Y ]] || die "aborted"
+      local codename; codename="$(. /etc/os-release 2>/dev/null; echo "${VERSION_CODENAME:-trixie}")"
+      sudo mkdir -p /etc/apt/keyrings
+      sudo wget -qO /etc/apt/keyrings/winehq-archive.key https://dl.winehq.org/wine-builds/winehq.key
+      sudo tee "/etc/apt/sources.list.d/winehq-${codename}.sources" >/dev/null <<EOF
+Types: deb
+URIs: https://dl.winehq.org/wine-builds/debian/
+Suites: ${codename}
+Components: main
+Architectures: amd64 i386
+Signed-By: /etc/apt/keyrings/winehq-archive.key
+EOF
+      sudo apt update
+      local vpkgs=""
+      case "$(gpu_vendor)" in
+        intel) vpkgs="intel-media-va-driver:i386" ;;
+        amd)   vpkgs="mesa-va-drivers:i386" ;;
+      esac
+      sudo apt install --install-recommends winehq-staging gstreamer1.0-libav:i386 gstreamer1.0-plugins-bad:i386 gstreamer1.0-vaapi:i386 $vpkgs
+      msg "wine is now: $(wine --version 2>/dev/null | head -1)"
+      ;;
+    missing)
+      warn "wine not installed — add the WineHQ repo, then: sudo apt install winehq-staging"
+      ;;
+    good)
+      msg "wine build already fine — skipping install"
+      ;;
+  esac
+
+  # VA-API driver: global (covers ~/.wine and everything else) + per-game env
+  local vd; vd="$(vaapi_driver)"
+  if [[ -n "$vd" ]]; then
+    if grep -qs "^LIBVA_DRIVER_NAME=$vd" /etc/environment 2>/dev/null; then
+      msg "LIBVA_DRIVER_NAME=$vd already set in /etc/environment"
+    else
+      msg "adding LIBVA_DRIVER_NAME=$vd to /etc/environment (global)"
+      sudo sh -c "grep -qs '^LIBVA_DRIVER_NAME=$vd' /etc/environment || echo 'LIBVA_DRIVER_NAME=$vd' >> /etc/environment"
+    fi
+    local name
+    for name in $(cmd_list_names); do
+      [[ -n "$only" && "$name" != "$only" ]] && continue
+      set_env "$name" LIBVA_DRIVER_NAME "$vd"
+      msg "  env[$name] LIBVA_DRIVER_NAME=$vd"
+    done
+  else
+    warn "no VA-API driver for this GPU — skipping driver env (software decode via gstreamer1.0-libav:i386)"
+  fi
+  msg "done — run 'winegame doctor' to verify"
 }
 
 # DLLs wine ships as builtins / standard system libs — not worth flagging
@@ -448,6 +568,19 @@ game_doctor() {
   local name="${1:-}" report=0
   [[ "${2:-}" == "--report" ]] && report=1
   require_game "$name"
+  local state; state="$(wine_build_state)"
+  case "$state" in
+    bad) warn "  wine build: Debian repack — movie deadlock risk (blank screen)"; msg "  → run: winegame doctor fix" ;;
+  esac
+  local vd; vd="$(vaapi_driver)"
+  if [[ -n "$vd" ]] && ! { [[ -n "${LIBVA_DRIVER_NAME:-}" ]] || grep -qs "^LIBVA_DRIVER_NAME=$vd" "$(env_file "$name")" 2>/dev/null || grep -qs "^LIBVA_DRIVER_NAME=$vd" /etc/environment 2>/dev/null; }; then
+    warn "  LIBVA_DRIVER_NAME: not $vd — video decode may fail"
+    msg "  → run: winegame doctor fix $name"
+  fi
+  if grep -qs '^GST_PLUGIN_FEATURE_RANK=' "$(env_file "$name")" 2>/dev/null; then
+    warn "  GST_PLUGIN_FEATURE_RANK set (disables VA-API) — with winehq+iHD you can drop it:"
+    msg "    winegame env $name GST_PLUGIN_FEATURE_RANK="
+  fi
   local gdir; gdir="$(game_dir "$name")/game"
   local -a exes=()
   while IFS= read -r -d '' f; do exes+=("$f"); done < <(find "$gdir" -maxdepth 2 -iname '*.exe' -print0 2>/dev/null || true)
@@ -619,6 +752,7 @@ ${C_B}commands:${C_X}
   list                        list prefixes
   remove <name> [-y]          delete a prefix (asks unless -y)
   doctor                      check wine/winetricks tooling
+  doctor fix [name]           install WineHQ wine + right VA-API driver (fixes movie deadlock)
   doctor <name>               scan a game for missing runtimes, offer winetricks fixes
 
 ${C_B}layout:${C_X}  $PREFIX_ROOT/<name>/{prefix,game,env,logs}
@@ -636,8 +770,10 @@ main() {
     --list-names) cmd_list_names ;;
     --install-completion) cmd_install_completion ;;
     doctor)
-      if [[ -n "${2:-}" ]]; then game_doctor "$2"
-      else cmd_doctor; fi
+      case "${2:-}" in
+        fix) cmd_doctor_fix "${3:-}" ;;
+        *) if [[ -n "${2:-}" ]]; then game_doctor "$2"; else cmd_doctor; fi ;;
+      esac
       ;;
     new|install|run|cfg|setver|tricks|list|remove|override|env|shell|log|wine) "cmd_$1" "${@:2}" ;;
     *) die "unknown command '$1' (see: winegame --help)" ;;
