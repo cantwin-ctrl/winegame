@@ -59,7 +59,10 @@ require_game() {
 # same trust model as your own shell rc.
 load_env() {
   local f; f="$(env_file "$1")"
-  [[ -f "$f" ]] && source "$f"
+  [[ -f "$f" ]] || return 0
+  set -a   # allexport: env-file vars must reach the wine process
+  source "$f"
+  set +a
 }
 
 # read one key from an env file (subshell so nothing leaks)
@@ -120,9 +123,10 @@ cmd_new() {
   mkdir -p "$(prefix_dir "$name")" "$(game_dir "$name")/game" "$(log_dir "$name")"
   echo "WINEARCH=$arch" > "$(env_file "$name")"
   # movie-decode fix: carry the right VA-API driver into every new prefix unless
-  # it's already global (covers winegstreamer video on Intel Skylake+ / AMD)
+  # the live session already has it (don't trust /etc/environment — it only
+  # applies to sessions started after the change; per-game env is harmless dup)
   local vd; vd="$(vaapi_driver)"
-  if [[ -n "$vd" ]] && [[ -z "${LIBVA_DRIVER_NAME:-}" ]] && ! grep -qs "^LIBVA_DRIVER_NAME=$vd" /etc/environment 2>/dev/null; then
+  if [[ -n "$vd" ]] && [[ -z "${LIBVA_DRIVER_NAME:-}" ]]; then
     set_env "$name" LIBVA_DRIVER_NAME "$vd"
   fi
   msg "created $(game_dir "$name") (arch=$arch)"
