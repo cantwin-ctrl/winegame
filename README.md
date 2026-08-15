@@ -1,12 +1,25 @@
-# winegame
+<div align="center">
 
-Per-game Wine prefix manager. One prefix per game, zero bloat.
+![winegame](logo.png)
+
+# 🍷 winegame
+
+**Per-game Wine prefix manager. One prefix per game, zero bloat.**
 
 Plain `wine` + `winetricks`, organized. No Steam, no Lutris, no GUI daemons — a single bash script that keeps every game in its own isolated prefix with persistent env vars, DLL overrides, per-run logs, and a shell escape hatch.
+
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+![Bash](https://img.shields.io/badge/language-bash-4EAA25.svg?logo=gnubash&logoColor=white)
+![Platform](https://img.shields.io/badge/platform-linux-lightgrey.svg)
+![Version](https://img.shields.io/badge/version-1.2.0-blue.svg)
+
+</div>
 
 ## Why
 
 Cracked game folders, itch.io games, old Windows apps — they all want their own Wine environment, and sharing one prefix is how everything breaks. `winegame` gives each game its own `~/.games/<name>/` and makes the common operations one command each.
+
+![demo](winegame.png)
 
 ## Install
 
@@ -20,6 +33,16 @@ Cracked game folders, itch.io games, old Windows apps — they all want their ow
 cp winegame ~/.local/bin/          # or anywhere on your PATH
 winegame doctor [name]              verify tooling; with a name: scan a game for missing runtimes
 winegame doctor fix                 one-shot: install WineHQ wine + fix video decode (see below)
+```
+
+## Quickstart
+
+```bash
+winegame new nekopara                     # create a prefix for a game
+winegame run nekopara /path/to/Game.exe   # first run: prompted to copy the folder in
+winegame tricks nekopara vcrun2019 -q     # install a runtime into that prefix
+winegame override nekopara dinput8=n,b    # force a cracked DLL to load
+winegame run -g nekopara                  # from now on: just this
 ```
 
 ## Fixing the "blank screen on VN movies" class of bug
@@ -65,20 +88,6 @@ winegame doctor fix [name]           install WineHQ wine + right VA-API driver (
 winegame doctor <name>               scan a game for missing runtimes, offer winetricks fixes
 ```
 
-## Typical workflow
-
-```bash
-winegame new nekopara                     # creates ~/.games/nekopara/
-winegame run nekopara /path/to/Game.exe   # first run: prompted to copy the folder in
-winegame tricks nekopara vcrun2019 -q     # install a runtime into that prefix
-winegame override nekopara dinput8=n,b    # force a cracked DLL to load
-winegame run -g nekopara                  # from now on: just this
-```
-
-When `run` is given an exe outside the prefix it asks once whether to copy the
-game folder in — after that the exe is auto-detected and all you type is
-`winegame run <name>`.
-
 ## Layout
 
 ```
@@ -109,7 +118,6 @@ winegame --install-completion   # adds tab completion for bash or zsh
 - winetricks
 - binutils (for objdump — used by `doctor <name>` import scanning)
 - pciutils (for lspci — used by `doctor`/`doctor fix` GPU detection)
-- winetricks (optional but very useful)
 - rsync (optional — installs fall back to `cp`)
 - gamemode (optional — powers the `-g` flag)
 
