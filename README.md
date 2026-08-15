@@ -45,6 +45,20 @@ winegame override nekopara dinput8=n,b    # force a cracked DLL to load
 winegame run -g nekopara                  # from now on: just this
 ```
 
+## Why not just use Bottles?
+
+[Bottles](https://usebottles.com/) is the same idea with a GUI — isolated per-game prefixes, runner switching, dependency installers. If you want a clickable interface and per-game Proton/DXVK runners, use Bottles. It's good at what it does.
+
+`winegame` is for the other half of the room:
+
+- **one bash script** — no Flatpak, no GTK app, no daemon. Works over SSH, in tmux, on a headless box
+- **scriptable** — every operation is a command, so it drops into your own tooling
+- **zero ceremony** — `winegame new` + `run` and you're in-game; no environment picker, no runner setup
+- **transparent** — prefixes are plain folders under `~/.games/`, plain `wine` + `winetricks` underneath. Nothing hidden
+- **`doctor fix`** — auto-installs WineHQ staging + the right VA-API driver, fixing the VN movie deadlock class of bug out of the box
+
+GUI people get Bottles. Terminal people get `winegame`. Both fine.
+
 ## Fixing the "blank screen on VN movies" class of bug
 
 Debian/Ubuntu ship a wine build whose builtin DirectShow decoders
