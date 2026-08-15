@@ -59,26 +59,18 @@ winegame run -g nekopara                  # from now on: just this
 
 GUI people get Bottles. Terminal people get `winegame`. Both fine.
 
-## Fixing the "blank screen on VN movies" class of bug
+## Troubleshooting
 
-Debian/Ubuntu ship a wine build whose builtin DirectShow decoders
-(`winegstreamer`) can **deadlock** when a game plays its OP/opening movie —
-the movie thread waits forever, the game hangs on a black/white window.
+**Game hangs on a black/white window when playing a movie** (VN OP videos on Debian/Ubuntu):
+
+Debian's wine build can deadlock on DirectShow video (`winegstreamer`). Fix once, every prefix benefits:
 
 ```bash
-winegame doctor        # detects the bad wine build + missing VA-API driver
-winegame doctor fix    # installs WineHQ staging (replaces Debian wine) and sets
-                       # LIBVA_DRIVER_NAME per GPU (iHD on Intel, radeonsi on AMD)
+winegame doctor        # detects bad wine build + missing VA-API driver
+winegame doctor fix    # installs WineHQ staging + right VA-API driver (iHD/radeonsi)
 ```
 
-`doctor fix` needs sudo once, then every prefix benefits. The driver env is set
-globally (`/etc/environment`) *and* per-game, and `winegame new` bakes it into
-every future prefix automatically. Games that already hang should be re-created
-fresh (`winegame new` + `install`) rather than patched — the old prefix carries
-whatever hacks you applied while debugging.
-
-Note: after switching wine versions, run each game once — the prefix
-auto-upgrades silently on first launch.
+Then re-create any game that already hung (`winegame new` + `install`). After switching wine versions, run each game once — the prefix auto-upgrades silently on first launch.
 
 ## Usage
 
