@@ -433,6 +433,14 @@ state_get() { # state-file, key → value
   if [[ -f "$f" ]]; then sed -n "s/^$k=//p" "$f" | head -1; fi
 }
 
+# vulkan loader present? (ldconfig may be outside PATH — probe known dirs too)
+vulkan_present() {
+  ldconfig -p 2>/dev/null | grep -q 'libvulkan\.so' && return 0
+  [[ -e /usr/lib/x86_64-linux-gnu/libvulkan.so.1 ]] && return 0
+  [[ -e /usr/lib/i386-linux-gnu/libvulkan.so.1 ]] && return 0
+  return 1
+}
+
 cmd_dxvk() {
   local name="${1:-}" mode=install dx12=1
   shift || true
@@ -460,7 +468,7 @@ dxvk_install() {
   local arch; arch="$(get_env_val "$name" WINEARCH)"; arch="${arch:-win64}"
   local sys32="$pfx/drive_c/windows/system32" syswow="$pfx/drive_c/windows/syswow64"
   [[ -d "$sys32" ]] || die "prefix not initialized (no system32) — open it once: winegame cfg $name"
-  if ldconfig -p 2>/dev/null | grep -q libvulkan; then
+  if vulkan_present; then
     msg "vulkan: present"
   else
     warn "libvulkan not found — DXVK needs Vulkan drivers (Intel: mesa-vulkan-drivers, NVIDIA: nvidia-driver)"
@@ -551,7 +559,7 @@ dxvk_info() {
   else
     msg "DXVK not installed for $name — wine builtin d3d in use (winegame dxvk $name)"
   fi
-  if ldconfig -p 2>/dev/null | grep -q libvulkan; then msg "  vulkan: present"
+  if vulkan_present; then msg "  vulkan: present"
   else warn "  vulkan: MISSING — DXVK won't work (apt install mesa-vulkan-drivers / nvidia-driver)"; fi
 }
 
@@ -857,7 +865,7 @@ cmd_doctor() {
   done
   if command -v gamemoderun >/dev/null 2>&1; then msg "  gamemode: found"
   else warn "  gamemode: NOT FOUND (optional — apt install gamemode)"; fi
-  if ldconfig -p 2>/dev/null | grep -q libvulkan; then msg "  vulkan: found (DXVK ready)"
+  if vulkan_present; then msg "  vulkan: found (DXVK ready)"
   else warn "  vulkan: NOT FOUND — DXVK needs it (apt install mesa-vulkan-drivers or nvidia-driver)"; fi
   if command -v rsync >/dev/null 2>&1; then msg "  rsync: found (fast installs)"
   else warn "  rsync: NOT FOUND (installs fall back to cp)"; fi
