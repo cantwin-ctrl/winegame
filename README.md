@@ -31,8 +31,9 @@ Cracked game folders, itch.io games, old Windows apps — they all want their ow
 # Debian/Ubuntu:  sudo apt install gamemode
 
 cp winegame ~/.local/bin/          # or anywhere on your PATH
-winegame doctor [name]              verify tooling; with a name: scan a game for missing runtimes
-winegame doctor fix                 one-shot: install WineHQ wine + fix video decode (see below)
+winegame doctor                     full health report: tooling, vulkan, GPU, per-game issues
+winegame doctor --game <name>       scan a game: missing runtimes, 3D/2D render, DXVK advice
+winegame doctor --fix               one-shot: install WineHQ wine + fix video decode (see below)
 ```
 
 ## Quickstart
@@ -55,7 +56,12 @@ winegame run -g nekopara                  # from now on: just this
 - **scriptable** — every operation is a command, so it drops into your own tooling
 - **zero ceremony** — `winegame new` + `run` and you're in-game; no environment picker, no runner setup
 - **transparent** — prefixes are plain folders under `~/.games/`, plain `wine` + `winetricks` underneath. Nothing hidden
-- **`doctor fix`** — auto-installs WineHQ staging + the right VA-API driver, fixing the VN movie deadlock class of bug out of the box
+- **`doctor`** — one command, full health report. Ends with a list of every
+  issue and the fix for each (missing tools, bad wine build, WINEARCH
+  mismatches, Vulkan, video decode). `--fix` auto-installs WineHQ staging +
+  the right VA-API driver, fixing the VN movie deadlock class of bug.
+- **`doctor --game <name>`** — per-game scan: missing runtimes (winetricks
+  fixes), whether the game is 3D or 2D, and DXVK advice either way
 
 GUI people get Bottles. Terminal people get `winegame`. Both fine.
 
@@ -105,8 +111,8 @@ winegame steamemu <name> --remove     # restore the original DLLs
 Debian's wine build can deadlock on DirectShow video (`winegstreamer`). Fix once, every prefix benefits:
 
 ```bash
-winegame doctor        # detects bad wine build + missing VA-API driver
-winegame doctor fix    # installs WineHQ staging + right VA-API driver (iHD/radeonsi)
+winegame doctor        # health report: detects bad wine build + missing VA-API driver + more
+winegame doctor --fix  # installs WineHQ staging + right VA-API driver (iHD/radeonsi)
 ```
 
 Then re-create any game that already hung (`winegame new` + `install`). After switching wine versions, run each game once — the prefix auto-upgrades silently on first launch.
@@ -128,9 +134,9 @@ winegame shell <name>                shell with prefix env loaded (escape hatch)
 winegame log <name> [-f]             show/tail latest run log
 winegame list                        list prefixes
 winegame remove <name> [-y]          delete a prefix (asks unless -y)
-winegame doctor                      check wine/winetricks tooling + wine build + GPU video driver
-winegame doctor fix [name]           install WineHQ wine + right VA-API driver (fixes movie deadlock)
-winegame doctor <name>               scan a game for missing runtimes, offer winetricks fixes
+winegame doctor [--tools]            health report: tooling, vulkan, GPU, per-game issues
+winegame doctor --game <name>        scan a game: missing runtimes, 3D/2D, DXVK advice
+winegame doctor --fix [name]         install WineHQ wine + right VA-API driver (fixes movie deadlock)
 winegame dxvk <name> [--dx11]        install DXVK + vkd3d-proton (Vulkan); --remove/--info
 winegame steamemu <name> [--appid N] replace steam_api*.dll with the Goldberg emulator; --remove
 ```
@@ -163,12 +169,12 @@ winegame --install-completion   # adds tab completion for bash or zsh
 - bash 4+ (every Linux distro ships 5)
 - wine (any modern version; WineHQ staging recommended)
 - winetricks
-- binutils (for objdump — used by `doctor <name>` import scanning)
+- binutils (for objdump — used by `doctor --game <name>` import scanning)
 - curl (downloads for `dxvk` / `steamemu`)
 - p7zip-full (unpacks the Goldberg package for `steamemu`)
 - zstd (unpacks vkd3d-proton for `dxvk`)
 - vulkan drivers (mesa-vulkan-drivers / nvidia-driver — required by DXVK)
-- pciutils (for lspci — used by `doctor`/`doctor fix` GPU detection)
+- pciutils (for lspci — used by `doctor` GPU detection)
 - rsync (optional — installs fall back to `cp`)
 - gamemode (optional — powers the `-g` flag)
 

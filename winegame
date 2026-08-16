@@ -16,8 +16,9 @@
 #   winegame log <name> [-f]               show/tail last run log
 #   winegame list                          list all game prefixes
 #   winegame remove <name> [-y]            delete a prefix
-#   winegame doctor                       check wine/winetricks tooling
-#   winegame doctor <name>                 scan a game for missing runtimes, offer fixes
+#   winegame doctor [--tools]             check tooling (wine, vulkan, GPU, games)
+#   winegame doctor --game <name>         scan a game: runtimes, 3D/2D, DXVK advice
+#   winegame doctor --fix [name]          install WineHQ wine + right VA-API driver
 #   winegame dxvk <name> [--dx11]          install DXVK + vkd3d-proton into a prefix
 #   winegame dxvk <name> --remove|--info   uninstall / show DXVK state
 #   winegame steamemu <name> [--appid N]   replace steam_api*.dll with Goldberg emulator
@@ -852,8 +853,37 @@ cmd_remove() {
   msg "removed $name"
 }
 
+optional_tool() { # name, hint, [version-command] — "" skips the version probe (wrappers)
+  local name=$1 hint=$2 ver
+  if [[ $# -ge 3 ]]; then ver=$3; else ver="$1 --version"; fi
+  if command -v "$1" >/dev/null 2>&1; then
+    local v=""
+    # sed -n '1p' reads to EOF — head would SIGPIPE the tool under pipefail
+    # some tools (7z) exit nonzero on --version — swallow it
+    [[ -n "$ver" ]] && v="$($ver 2>/dev/null | sed -n '1p' | tr -s ' ' | cut -d' ' -f1-2)" || true
+    msg "  $1: ${v:-found}"
+  else
+    warn "  $1: NOT FOUND ($2)"
+    issues+=("$1 missing — $2")
+  fi
+}
+
+# loaded GPU kernel driver: nvidia / amdgpu / nouveau / i915 / unknown
+gpu_driver() {
+  local m
+  if lsmod 2>/dev/null | grep -q '^nvidia '; then echo "nvidia (proprietary)"; return; fi
+  for m in amdgpu nouveau i915; do
+    if lsmod 2>/dev/null | grep -q "^$m"; then echo "$m"; return; fi
+    [[ -d "/sys/module/$m" ]] && { echo "$m"; return; }
+  done
+  echo "unknown"
+}
+
 cmd_doctor() {
+  local -a issues=()
   msg "winegame $VERSION — prefix root: $PREFIX_ROOT"
+  msg ""
+  msg "${C_B}tooling:${C_X}"
   local ok=1
   for t in wine wineboot winecfg winepath winetricks curl; do
     if command -v "$t" >/dev/null; then
@@ -861,38 +891,78 @@ cmd_doctor() {
       msg "  $t: ${v:-found}"
     else
       warn "  $t: NOT FOUND"; ok=0
+      issues+=("$t missing — sudo apt install $t")
     fi
   done
-  if command -v gamemoderun >/dev/null 2>&1; then msg "  gamemode: found"
-  else warn "  gamemode: NOT FOUND (optional — apt install gamemode)"; fi
-  if vulkan_present; then msg "  vulkan: found (DXVK ready)"
-  else warn "  vulkan: NOT FOUND — DXVK needs it (apt install mesa-vulkan-drivers or nvidia-driver)"; fi
-  if command -v rsync >/dev/null 2>&1; then msg "  rsync: found (fast installs)"
-  else warn "  rsync: NOT FOUND (installs fall back to cp)"; fi
-  local n=0
-  [[ -d "$PREFIX_ROOT" ]] && n="$(cmd_list | grep -c . || true)"
-  msg "  games: $n"
+  msg ""
+  msg "${C_B}optional:${C_X}"
+  optional_tool gamemoderun "apt install gamemode — powers winegame run -g" ""
+  optional_tool rsync "installs fall back to cp"
+  optional_tool 7z "apt install p7zip-full — needed by steamemu"
+  optional_tool zstd "needed by dxvk (vkd3d-proton tarballs)"
+  optional_tool objdump "apt install binutils — needed for import scans"
+  msg ""
+  msg "${C_B}system:${C_X}"
   local state; state="$(wine_build_state)"
   case "$state" in
-    bad)     warn "  wine build: Debian repack — known winegstreamer movie deadlock (VNs hang on a blank screen)"; msg "  → run: winegame doctor fix" ;;
-    missing) warn "  wine: NOT INSTALLED — run: winegame doctor fix" ;;
+    bad)     warn "  wine build: Debian repack — known winegstreamer movie deadlock (VNs hang on a blank screen)"; msg "  → fix: winegame doctor --fix"; issues+=("bad wine build (movie deadlock) — winegame doctor --fix") ;;
+    missing) warn "  wine: NOT INSTALLED — fix: winegame doctor --fix"; issues+=("wine not installed — winegame doctor --fix") ;;
     good)    msg "  wine build: not the Debian repack — OK" ;;
   esac
-  local gpu; gpu="$(gpu_vendor)"
-  msg "  GPU: $gpu"
+  while IFS= read -r line; do msg "  gpu: $line"; done < <(lspci 2>/dev/null | grep -iE 'vga|3d controller|display controller' | sed 's/^ *//')
+  msg "  driver: $(gpu_driver)"
+  if vulkan_present; then
+    local dev; dev="$(vulkaninfo --summary 2>/dev/null | sed -n 's/^.*deviceName * = *//p' | grep -vi llvmpipe | head -1)"
+    msg "  vulkan: present${dev:+ — $dev}"
+  else
+    warn "  vulkan: NOT FOUND — DXVK needs it (apt install mesa-vulkan-drivers or nvidia-driver)"
+    issues+=("vulkan missing — apt install mesa-vulkan-drivers or nvidia-driver")
+  fi
   local vd; vd="$(vaapi_driver)"
   if [[ -n "$vd" ]]; then
     if [[ -n "${LIBVA_DRIVER_NAME:-}" ]] || grep -qs "^LIBVA_DRIVER_NAME=$vd" /etc/environment 2>/dev/null; then
-      msg "  VA-API driver: $vd (hardware video decode OK)"
+      msg "  va-api: $vd (hardware video decode OK)"
     else
-      warn "  VA-API driver: unset → wrong fallback breaks video decode ($gpu)"
-      msg "  → run: winegame doctor fix"
+      warn "  va-api: unset → wrong fallback breaks video decode"
+      msg "  → fix: winegame doctor --fix"
+      issues+=("VA-API driver unset — winegame doctor --fix")
     fi
   else
-    warn "  GPU ($gpu): no VA-API driver — videos need software decode (gstreamer1.0-libav:i386)"
-    msg "  → run: winegame doctor fix"
+    warn "  va-api: no driver for this GPU — videos need software decode (gstreamer1.0-libav:i386)"
+    msg "  → fix: winegame doctor --fix"
+    issues+=("no VA-API driver — winegame doctor --fix")
   fi
-  [[ $ok -eq 1 ]] && msg "tooling looks good." || warn "install missing tools: sudo apt install wine winetricks"
+  msg ""
+  msg "${C_B}games:${C_X}"
+  local n=0
+  [[ -d "$PREFIX_ROOT" ]] && n="$(cmd_list | grep -c . || true)"
+  msg "  prefixes: $n"
+  local du; du="$(du -sh "$PREFIX_ROOT" 2>/dev/null | cut -f1)"
+  [[ -n "$du" ]] && msg "  disk used: $du"
+  local name env_arch reg_arch stfile
+  for name in $(cmd_list_names); do
+    env_arch="$(get_env_val "$name" WINEARCH)"
+    reg_arch="$(grep -m1 '^#arch=' "$(prefix_dir "$name")/system.reg" 2>/dev/null | cut -d= -f2 || true)"
+    if [[ -n "$env_arch" && -n "$reg_arch" && "$env_arch" != "$reg_arch" ]]; then
+      warn "  $name: WINEARCH mismatch (env=$env_arch, prefix=$reg_arch) — wine refuses to run"
+      msg "    → fix: winegame env $name WINEARCH=$reg_arch"
+      issues+=("$name: WINEARCH mismatch — winegame env $name WINEARCH=$reg_arch")
+    elif [[ -n "$reg_arch" ]]; then
+      msg "  $name: arch OK ($reg_arch)"
+    fi
+    stfile="$(game_dir "$name")/dxvk.state"
+    if [[ -f "$stfile" ]]; then
+      msg "  $name: DXVK installed ($(state_get "$stfile" dxvk))"
+    fi
+  done
+  msg ""
+  if [[ ${#issues[@]} -eq 0 ]]; then
+    msg "${C_G}health:${C_X} all good — nothing needs attention"
+  else
+    warn "${C_Y}health:${C_X} ${#issues[@]} thing(s) need attention:"
+    local i
+    for i in "${issues[@]}"; do warn "  - $i"; done
+  fi
 }
 
 # wine build state: "bad" = Debian repack (broken winegstreamer movie path),
@@ -1028,6 +1098,14 @@ game_doctor() {
   case "$state" in
     bad) warn "  wine build: Debian repack — movie deadlock risk (blank screen)"; msg "  → run: winegame doctor fix" ;;
   esac
+  # env WINEARCH vs actual prefix arch — mismatch makes wine refuse to run
+  local env_arch reg_arch
+  env_arch="$(get_env_val "$name" WINEARCH)"
+  reg_arch="$(grep -m1 '^#arch=' "$(prefix_dir "$name")/system.reg" 2>/dev/null | cut -d= -f2 || true)"
+  if [[ -n "$env_arch" && -n "$reg_arch" && "$env_arch" != "$reg_arch" ]]; then
+    warn "  WINEARCH mismatch: env says $env_arch but prefix is $reg_arch — wine refuses to run"
+    msg "  → fix: winegame env $name WINEARCH=$reg_arch"
+  fi
   local vd; vd="$(vaapi_driver)"
   if [[ -n "$vd" ]] && ! { [[ -n "${LIBVA_DRIVER_NAME:-}" ]] || grep -qs "^LIBVA_DRIVER_NAME=$vd" "$(env_file "$name")" 2>/dev/null || grep -qs "^LIBVA_DRIVER_NAME=$vd" /etc/environment 2>/dev/null; }; then
     warn "  LIBVA_DRIVER_NAME: not $vd — video decode may fail"
@@ -1059,12 +1137,19 @@ game_doctor() {
     while IFS= read -r -d '' f; do present["$(basename "$f" | tr 'A-Z' 'a-z')"]=1; done < <(find "$d" -maxdepth 1 -type f -print0 2>/dev/null)
   done
 
-  local -A missing=() verbs=()
+  local -A missing=() verbs=() d3d=()
   local e dll verb
   for e in "${exes[@]}"; do
     while read -r dll; do
       [[ -n "$dll" ]] || continue
       dll="$(tr 'A-Z' 'a-z' <<< "$dll")"
+      case "$dll" in
+        d3d8.dll) d3d[d3d8]=1 ;;
+        d3d9.dll) d3d[d3d9]=1 ;;
+        d3d10.dll|d3d10_1.dll|d3d10core.dll) d3d[d3d10]=1 ;;
+        d3d11.dll|dxgi.dll) d3d[d3d11]=1 ;;
+        d3d12.dll) d3d[d3d12]=1 ;;
+      esac
       [[ -n "${missing[$dll]:-}" || -n "${present[$dll]:-}" ]] && continue
       case "$dll" in
         api-ms-*|ext-ms-*) continue ;;
@@ -1076,6 +1161,21 @@ game_doctor() {
       fi
     done < <(objdump -p "$e" 2>/dev/null | grep -i 'DLL Name:' | awk '{print $3}')
   done
+
+  # render advice: 3D game → DXVK, 2D → skip it
+  local -a levels=(d3d12 d3d11 d3d10 d3d9 d3d8)
+  local lvl="" l
+  for l in "${levels[@]}"; do [[ -n "${d3d[$l]:-}" ]] && { lvl=$l; break; }; done
+  if [[ -n "$lvl" ]]; then
+    local stfile; stfile="$(game_dir "$name")/dxvk.state"
+    if [[ -f "$stfile" ]]; then
+      msg "  render: Direct3D ${lvl#d3d} — DXVK installed ($(state_get "$stfile" dxvk))"
+    else
+      msg "  render: 3D game (Direct3D ${lvl#d3d}) — DXVK recommended: winegame dxvk $name"
+    fi
+  else
+    msg "  render: 2D — no Direct3D imports, DXVK won't help"
+  fi
 
   if [[ ${#missing[@]} -eq 0 ]]; then
     msg "no missing DLLs — every import resolves or ships with the game"
@@ -1207,9 +1307,9 @@ ${C_B}commands:${C_X}
   log <name> [-f]             show/tail latest run log
   list                        list prefixes
   remove <name> [-y]          delete a prefix (asks unless -y)
-  doctor                      check wine/winetricks tooling
-  doctor fix [name]           install WineHQ wine + right VA-API driver (fixes movie deadlock)
-  doctor <name>               scan a game for missing runtimes, offer winetricks fixes
+  doctor [--tools]            check tooling: wine, winetricks, vulkan, GPU, games
+  doctor --game <name>        scan a game: missing runtimes, 3D/2D render, DXVK advice
+  doctor --fix [name]         install WineHQ wine + right VA-API driver (fixes movie deadlock)
   dxvk <name> [--dx11]        install DXVK (d3d8/9/10/11) + vkd3d-proton (d3d12) → Vulkan;
                               --remove uninstalls, --info shows state
   steamemu <name> [--appid N] replace steam_api*.dll with the Goldberg emulator
@@ -1231,8 +1331,13 @@ main() {
     --install-completion) cmd_install_completion ;;
     doctor)
       case "${2:-}" in
-        fix) cmd_doctor_fix "${3:-}" ;;
-        *) if [[ -n "${2:-}" ]]; then game_doctor "$2"; else cmd_doctor; fi ;;
+        --game|--scan)   game_doctor "${3:-}" ;;
+        --fix)           cmd_doctor_fix "${3:-}" ;;
+        --tools|--system) cmd_doctor ;;
+        -h|--help)       echo "doctor usage: --tools (default) | --game <name> | --fix [name]" ;;
+        fix)             cmd_doctor_fix "${3:-}" ;;   # legacy alias
+        "")              cmd_doctor ;;
+        *)               game_doctor "$2" ;;          # legacy alias: doctor <name>
       esac
       ;;
     new|install|run|cfg|setver|tricks|list|remove|override|env|shell|log|wine|dxvk|steamemu) "cmd_$1" "${@:2}" ;;
