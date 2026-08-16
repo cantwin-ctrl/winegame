@@ -18,6 +18,10 @@
 #   winegame remove <name> [-y]            delete a prefix
 #   winegame doctor                       check wine/winetricks tooling
 #   winegame doctor <name>                 scan a game for missing runtimes, offer fixes
+#   winegame dxvk <name> [--dx11]          install DXVK + vkd3d-proton into a prefix
+#   winegame dxvk <name> --remove|--info   uninstall / show DXVK state
+#   winegame steamemu <name> [--appid N]   replace steam_api*.dll with Goldberg emulator
+#   winegame steamemu <name> --remove      restore original DLLs
 #
 # Layout per game:  $PREFIX_ROOT/<name>/prefix   (the WINEPREFIX)
 #                   $PREFIX_ROOT/<name>/game     (drop your game files here)
@@ -28,9 +32,9 @@
 
 set -euo pipefail
 
-VERSION="1.2.0"
+VERSION="1.3.0"
 PREFIX_ROOT="${WINE_GAMES_DIR:-$HOME/.games}"
-COMMANDS=(new install run cfg setver tricks override env wine shell log list remove doctor)
+COMMANDS=(new install run cfg setver tricks override env wine shell log list remove doctor dxvk steamemu)
 
 # --- colors (off when piped or NO_COLOR) -------------------------------------
 if [[ -t 1 ]] && [[ -z "${NO_COLOR:-}" ]]; then
@@ -346,6 +350,444 @@ cmd_env() {
   done
 }
 
+# --- DXVK / vkd3d-proton (Direct3D → Vulkan) ---------------------------------
+
+latest_release_tag() { # owner/repo, pinned-tag → latest GitHub release tag (pinned if API fails)
+  local repo=$1 pinned=$2 tag
+  tag="$(curl -fsSL --max-time 15 "https://api.github.com/repos/$repo/releases/latest" 2>/dev/null \
+    | sed -n 's/^  "tag_name": "\(.*\)",/\1/p' | head -1)"
+  echo "${tag:-$pinned}"
+}
+
+cache_dir() { echo "${XDG_CACHE_HOME:-$HOME/.cache}/winegame"; }
+
+fetch_dxvk() { # tag → extracted dir (cached under ~/.cache/winegame)
+  local tag=$1 cache; cache="$(cache_dir)"
+  local dir="$cache/dxvk-$tag"
+  if [[ -d "$dir" ]]; then echo "$dir"; return 0; fi
+  command -v curl >/dev/null 2>&1 || die "curl needed for downloads (sudo apt install curl)"
+  local tb="$cache/dxvk-${tag#v}.tar.gz"
+  if [[ ! -s "$tb" ]]; then
+    msg "downloading DXVK $tag ..." >&2
+    curl -fsSL --retry 5 --retry-delay 3 --max-time 900 -C - -o "$tb.part" \
+      "https://github.com/doitsujin/dxvk/releases/download/$tag/dxvk-${tag#v}.tar.gz" \
+      || die "DXVK download failed"
+    mv -f "$tb.part" "$tb"
+  fi
+  mkdir -p "$dir"
+  tar xzf "$tb" -C "$dir" --strip-components=1
+  echo "$dir"
+}
+
+fetch_vkd3d() { # tag → extracted dir (cached)
+  local tag=$1 cache; cache="$(cache_dir)"
+  local dir="$cache/vkd3d-proton-$tag"
+  if [[ -d "$dir" ]]; then echo "$dir"; return 0; fi
+  command -v curl >/dev/null 2>&1 || die "curl needed for downloads (sudo apt install curl)"
+  local tb="$cache/vkd3d-proton-${tag#v}.tar.zst"
+  if [[ ! -s "$tb" ]]; then
+    msg "downloading vkd3d-proton $tag ..." >&2
+    curl -fsSL --retry 5 --retry-delay 3 --max-time 900 -C - -o "$tb.part" \
+      "https://github.com/HansKristian-Work/vkd3d-proton/releases/download/$tag/vkd3d-proton-${tag#v}.tar.zst" \
+      || die "vkd3d-proton download failed"
+    mv -f "$tb.part" "$tb"
+  fi
+  mkdir -p "$dir"
+  tar --zstd -xf "$tb" -C "$dir" --strip-components=1
+  echo "$dir"
+}
+
+add_overrides() { # name dll... → merge dll=n,b into the prefix's WINEDLLOVERRIDES
+  local name=$1; shift
+  local cur; cur="$(get_env_val "$name" WINEDLLOVERRIDES)"
+  local -a merged=()
+  local e dll dup
+  IFS=';' read -ra merged <<< "$cur"
+  for dll in "$@"; do
+    dup=0
+    for e in "${merged[@]}"; do [[ "${e%%=*}" == "$dll" ]] && dup=1; done
+    [[ $dup -eq 0 ]] && merged+=("$dll=n,b")
+  done
+  set_env "$name" WINEDLLOVERRIDES "$(IFS=';'; echo "${merged[*]}")"
+}
+
+del_overrides() { # name dll... → drop those keys from WINEDLLOVERRIDES
+  local name=$1; shift
+  local cur; cur="$(get_env_val "$name" WINEDLLOVERRIDES)"
+  [[ -n "$cur" ]] || return 0
+  local -a existing=() keep=()
+  local e dll skip
+  IFS=';' read -ra existing <<< "$cur"
+  for e in "${existing[@]}"; do
+    [[ -z "$e" ]] && continue
+    skip=0
+    for dll in "$@"; do [[ "${e%%=*}" == "$dll" ]] && skip=1; done
+    [[ $skip -eq 0 ]] && keep+=("$e")
+  done
+  if [[ ${#keep[@]} -eq 0 ]]; then del_env "$name" WINEDLLOVERRIDES
+  else set_env "$name" WINEDLLOVERRIDES "$(IFS=';'; echo "${keep[*]}")"; fi
+}
+
+state_get() { # state-file, key → value
+  local f=$1 k=$2
+  if [[ -f "$f" ]]; then sed -n "s/^$k=//p" "$f" | head -1; fi
+}
+
+cmd_dxvk() {
+  local name="${1:-}" mode=install dx12=1
+  shift || true
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --remove|--uninstall) mode=remove ;;
+      --info|--status) mode=info ;;
+      --dx11) dx12=0 ;;
+      --dx12) dx12=1 ;;
+      *) die "unknown option '$1' (dxvk flags: --dx11, --remove, --info)" ;;
+    esac
+    shift
+  done
+  require_game "$name"
+  case "$mode" in
+    info)   dxvk_info "$name" ;;
+    remove) dxvk_remove "$name" ;;
+    *)      dxvk_install "$name" "$dx12" ;;
+  esac
+}
+
+dxvk_install() {
+  local name=$1 dx12=$2
+  local pfx; pfx="$(prefix_dir "$name")"
+  local arch; arch="$(get_env_val "$name" WINEARCH)"; arch="${arch:-win64}"
+  local sys32="$pfx/drive_c/windows/system32" syswow="$pfx/drive_c/windows/syswow64"
+  [[ -d "$sys32" ]] || die "prefix not initialized (no system32) — open it once: winegame cfg $name"
+  if ldconfig -p 2>/dev/null | grep -q libvulkan; then
+    msg "vulkan: present"
+  else
+    warn "libvulkan not found — DXVK needs Vulkan drivers (Intel: mesa-vulkan-drivers, NVIDIA: nvidia-driver)"
+  fi
+  local x64dir="$sys32" x86dir="$sys32"
+  [[ "$arch" == win64 ]] && x86dir="$syswow"
+  if [[ "$arch" == win64 ]] && [[ ! -d "$x86dir" ]]; then
+    die "prefix has no syswow64 — was it created as win32? (winegame new $name --win64)"
+  fi
+  local dtag dsrc vtag vsrc
+  dtag="$(latest_release_tag doitsujin/dxvk v3.0.2)"
+  dsrc="$(fetch_dxvk "$dtag")"
+  local -a over=()
+  local dll b
+  for dll in "$dsrc"/x64/*.dll; do
+    [[ -e "$dll" ]] || continue
+    cp -f "$dll" "$x64dir/"
+    b="$(basename "$dll" .dll)"
+    [[ " ${over[*]:-} " == *" $b "* ]] || over+=("$b")
+  done
+  for dll in "$dsrc"/x32/*.dll; do
+    [[ -e "$dll" ]] || continue
+    cp -f "$dll" "$x86dir/"
+    b="$(basename "$dll" .dll)"
+    [[ " ${over[*]:-} " == *" $b "* ]] || over+=("$b")
+  done
+  if [[ $dx12 -eq 1 ]]; then
+    vtag="$(latest_release_tag HansKristian-Work/vkd3d-proton v3.0.1)"
+    vsrc="$(fetch_vkd3d "$vtag")"
+    for dll in "$vsrc"/x64/*.dll; do
+      [[ -e "$dll" ]] || continue
+      cp -f "$dll" "$x64dir/"
+      b="$(basename "$dll" .dll)"
+      [[ " ${over[*]:-} " == *" $b "* ]] || over+=("$b")
+    done
+    for dll in "$vsrc"/x86/*.dll; do
+      [[ -e "$dll" ]] || continue
+      cp -f "$dll" "$x86dir/"
+      b="$(basename "$dll" .dll)"
+      [[ " ${over[*]:-} " == *" $b "* ]] || over+=("$b")
+    done
+  fi
+  add_overrides "$name" "${over[@]}"
+  {
+    echo "dxvk=$dtag"
+    [[ $dx12 -eq 1 ]] && echo "vkd3d=$vtag"
+    echo "overrides=$(IFS=,; echo "${over[*]}")"
+  } > "$(game_dir "$name")/dxvk.state"
+  msg "DXVK $dtag installed into $name: ${over[*]} → native"
+  [[ $dx12 -eq 1 ]] && msg "vkd3d-proton $vtag installed (d3d12 → native)"
+  msg "run it: winegame run $name"
+}
+
+dxvk_remove() {
+  local name=$1
+  local state; state="$(game_dir "$name")/dxvk.state"
+  [[ -f "$state" ]] || die "DXVK not installed for $name (winegame dxvk $name)"
+  local over; over="$(state_get "$state" overrides)"
+  local pfx; pfx="$(prefix_dir "$name")"
+  local arch; arch="$(get_env_val "$name" WINEARCH)"
+  local -a dirs=("$pfx/drive_c/windows/system32")
+  [[ "$arch" == win64 ]] && dirs+=("$pfx/drive_c/windows/syswow64")
+  local -a dl=()
+  local b d
+  IFS=',' read -ra dl <<< "$over"
+  for b in "${dl[@]}"; do
+    for d in "${dirs[@]}"; do
+      if [[ -f "$d/$b.dll" ]]; then
+        rm -f "$d/$b.dll"
+        msg "  removed $d/$b.dll"
+      fi
+    done
+  done
+  del_overrides "$name" "${dl[@]}"
+  rm -f "$state"
+  msg "DXVK removed — wine builtins restored"
+}
+
+dxvk_info() {
+  local name=$1
+  local state; state="$(game_dir "$name")/dxvk.state"
+  if [[ -f "$state" ]]; then
+    msg "DXVK state for $name:"
+    msg "  dxvk: $(state_get "$state" dxvk)"
+    local v; v="$(state_get "$state" vkd3d)"
+    [[ -n "$v" ]] && msg "  vkd3d: $v"
+    msg "  overrides: $(state_get "$state" overrides)"
+  else
+    msg "DXVK not installed for $name — wine builtin d3d in use (winegame dxvk $name)"
+  fi
+  if ldconfig -p 2>/dev/null | grep -q libvulkan; then msg "  vulkan: present"
+  else warn "  vulkan: MISSING — DXVK won't work (apt install mesa-vulkan-drivers / nvidia-driver)"; fi
+}
+
+# --- Goldberg Steam emulator -------------------------------------------------
+
+fetch_gbe() { # tag → extracted dir (cached)
+  local tag=$1 cache; cache="$(cache_dir)"
+  local dir="$cache/gbe-$tag"
+  if [[ -d "$dir" ]]; then echo "$dir"; return 0; fi
+  command -v curl >/dev/null 2>&1 || die "curl needed for downloads (sudo apt install curl)"
+  command -v 7z >/dev/null 2>&1 || die "7z needed to unpack goldberg (sudo apt install p7zip-full)"
+  local tb="$cache/gbe-$tag.7z"
+  if [[ ! -s "$tb" ]]; then
+    msg "downloading Goldberg emulator $tag ..." >&2
+    curl -fsSL --retry 5 --retry-delay 3 --max-time 900 -C - -o "$tb.part" \
+      "https://github.com/Detanup01/gbe_fork/releases/download/$tag/emu-win-release.7z" \
+      || die "goldberg download failed"
+    mv -f "$tb.part" "$tb"
+  fi
+  mkdir -p "$dir"
+  ( cd "$dir" && 7z x -y "$tb" >/dev/null ) || die "goldberg extract failed"
+  echo "$dir"
+}
+
+resolve_appid() { # name, gamedir, flag-value → appid
+  local name=$1 gdir=$2 flag=$3
+  if [[ -n "$flag" ]]; then echo "$flag"; return 0; fi
+  local existing
+  existing="$(find "$gdir" -maxdepth 3 -name steam_appid.txt -print -quit 2>/dev/null)"
+  if [[ -n "$existing" ]]; then
+    sed -n '1s/[^0-9]//gp' "$existing" | head -1
+    return 0
+  fi
+  local ans=480
+  if [[ -t 0 ]]; then
+    read -rp "Steam AppID for this game (Enter = 480): " ans
+    [[ "$ans" =~ ^[0-9]+$ ]] || ans=480
+  else
+    warn "no --appid and no steam_appid.txt — using 480 (edit the file in the game dir later)"
+  fi
+  echo "$ans"
+}
+
+cmd_steamemu() {
+  local name="${1:-}" appid="" mode=install
+  shift || true
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --remove|--uninstall) mode=remove ;;
+      --info|--status) mode=info ;;
+      --appid)
+        shift
+        [[ -n "${1:-}" && "$1" =~ ^[0-9]+$ ]] || die "--appid needs a number (Steam AppID)"
+        appid=$1
+        ;;
+      *) die "unknown option '$1' (steamemu flags: --appid N, --remove, --info)" ;;
+    esac
+    shift
+  done
+  require_game "$name"
+  case "$mode" in
+    info)   steamemu_info "$name" ;;
+    remove) steamemu_remove "$name" ;;
+    *)      steamemu_install "$name" "$appid" ;;
+  esac
+}
+
+steamemu_install() {
+  local name=$1 appid="${2:-}"
+  local gdir; gdir="$(game_dir "$name")/game"
+  [[ -d "$gdir" ]] || die "no game files yet — install first: winegame install $name <folder>"
+  command -v objdump >/dev/null 2>&1 || warn "objdump not found — using broad 'replace all steam_api*.dll' mode (apt install binutils for precise mode)"
+
+  local -A wanted=()       # steam_api(64).dll → path in game dir
+  local -A scneeded=()     # steamclient(64).dll → dir to drop the emu copy
+  local -a exes=()
+  while IFS= read -r -d '' f; do exes+=("$f"); done < <(find "$gdir" -maxdepth 3 -iname '*.exe' -print0 2>/dev/null || true)
+  local e dll loc
+  if command -v objdump >/dev/null 2>&1; then
+    for e in "${exes[@]}"; do
+      while read -r dll; do
+        [[ -n "$dll" ]] || continue
+        dll="$(tr 'A-Z' 'a-z' <<< "$dll")"
+        case "$dll" in
+          steam_api.dll|steam_api64.dll)
+            [[ -n "${wanted[$dll]:-}" ]] && continue
+            loc=""
+            [[ -f "$(dirname "$e")/$dll" ]] && loc="$(dirname "$e")/$dll"
+            [[ -z "$loc" && -f "$gdir/$dll" ]] && loc="$gdir/$dll"
+            [[ -z "$loc" ]] && loc="$(find "$gdir" -maxdepth 3 -iname "$dll" -print -quit 2>/dev/null)"
+            [[ -n "$loc" ]] && wanted[$dll]="$loc"
+            ;;
+          steamclient.dll|steamclient64.dll)
+            # game imports a steamclient it doesn't ship → emu must provide it
+            if [[ -z "$(find "$gdir" -maxdepth 3 -iname "$dll" -print -quit 2>/dev/null)" ]]; then
+              [[ -n "${scneeded[$dll]:-}" ]] || scneeded[$dll]="$(dirname "$e")"
+            fi
+            ;;
+        esac
+      done < <(objdump -p "$e" 2>/dev/null | grep -i 'DLL Name:' | awk '{print $3}')
+    done
+  fi
+
+  if [[ ${#wanted[@]} -eq 0 ]]; then
+    local -a found=()
+    while IFS= read -r -d '' f; do found+=("$f"); done < <(find "$gdir" -maxdepth 3 \( -iname 'steam_api.dll' -o -iname 'steam_api64.dll' \) -print0 2>/dev/null || true)
+    if [[ ${#found[@]} -eq 0 ]]; then
+      die "no steam_api.dll / steam_api64.dll in $gdir — nothing to emulate (check the game's actual dll name)"
+    fi
+    local ans=n
+    if [[ -t 0 ]]; then
+      warn "no exe imports steam_api directly (packed exe?) — found ${#found[@]} steam_api dll(s)"
+      read -rp "replace all of them with Goldberg? [y/N] " ans
+    fi
+    if [[ "$ans" != y && "$ans" != Y ]]; then
+      msg "aborted (install binutils for precise import detection)"
+      return 1
+    fi
+    local fb
+    for f in "${found[@]}"; do
+      fb="$(basename "$f" | tr 'A-Z' 'a-z')"
+      wanted[$fb]="$f"
+    done
+  fi
+
+  local tag; tag="$(latest_release_tag Detanup01/gbe_fork release-2026_07_19)"
+  local src; src="$(fetch_gbe "$tag")"
+  local reg="$src/release/regular"
+  local -a files=() dirs=()
+  local b2 path srcfile
+  for b2 in steam_api64.dll steam_api.dll; do
+    [[ -n "${wanted[$b2]:-}" ]] || continue
+    path="${wanted[$b2]}"
+    case "$b2" in
+      steam_api64.dll) srcfile="$reg/x64/steam_api64.dll" ;;
+      steam_api.dll)   srcfile="$reg/x86/steam_api.dll" ;;
+    esac
+    [[ -f "$srcfile" ]] || die "goldberg package missing $srcfile"
+    if [[ ! -f "$path.bak-goldberg" ]]; then
+      cp -f "$path" "$path.bak-goldberg"
+      msg "  backed up $path"
+    fi
+    cp -f "$srcfile" "$path"
+    msg "  replaced $path with Goldberg ($b2)"
+    files+=("$path")
+    dirs+=("$(dirname "$path")")
+  done
+
+  local scb scdir scsrc
+  for scb in steamclient64.dll steamclient.dll; do
+    [[ -n "${scneeded[$scb]:-}" ]] || continue
+    scdir="${scneeded[$scb]}"
+    if [[ "$scb" == steamclient64.dll ]]; then scsrc="$src/release/experimental/x64/steamclient64.dll"
+    else scsrc="$src/release/experimental/x86/steamclient.dll"; fi
+    if [[ -f "$scsrc" ]]; then
+      cp -f "$scsrc" "$scdir/$scb"
+      msg "  added $scb next to the exe (imported but not shipped)"
+      files+=("$scdir/$scb")
+    else
+      warn "  $scb is imported but not in the goldberg package — game may need Steam running"
+    fi
+  done
+
+  local appid_out; appid_out="$(resolve_appid "$name" "$gdir" "$appid")"
+  local made=0 adir
+  while IFS= read -r adir; do
+    [[ -n "$adir" ]] || continue
+    if [[ -f "$adir/steam_appid.txt" ]]; then
+      if [[ -n "$appid" ]]; then
+        echo "$appid_out" > "$adir/steam_appid.txt"
+        msg "  updated $adir/steam_appid.txt = $appid_out (--appid override)"
+        made=1
+      else
+        msg "  steam_appid.txt already present: $(tr -d '[:space:]' < "$adir/steam_appid.txt")"
+      fi
+    else
+      echo "$appid_out" > "$adir/steam_appid.txt"
+      msg "  wrote $adir/steam_appid.txt = $appid_out"
+      made=1
+    fi
+  done < <(printf '%s\n' "${dirs[@]}" | sort -u)
+
+  {
+    echo "version=$tag"
+    echo "appid=$appid_out"
+    echo "made_appid=$made"
+    local ff
+    for ff in "${files[@]}"; do echo "file=$ff"; done
+  } > "$(game_dir "$name")/steamemu.state"
+  msg "Goldberg $tag installed — run: winegame run $name"
+  msg "saves go to ~/.local/share/GSE Saves/ (per-game tweaks: steam_settings/ folder beside the dll)"
+}
+
+steamemu_remove() {
+  local name=$1
+  local state; state="$(game_dir "$name")/steamemu.state"
+  [[ -f "$state" ]] || die "goldberg not installed for $name (winegame steamemu $name)"
+  local f adir
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    if [[ -f "$f.bak-goldberg" ]]; then
+      mv -f "$f.bak-goldberg" "$f"
+      msg "  restored $f"
+    else
+      rm -f "$f"
+      msg "  removed $f (no backup found)"
+    fi
+  done < <(sed -n 's/^file=//p' "$state")
+  if [[ "$(state_get "$state" made_appid)" == 1 ]]; then
+    while IFS= read -r f; do
+      [[ -n "$f" ]] || continue
+      adir="$(dirname "$f")"
+      if [[ -f "$adir/steam_appid.txt" ]]; then
+        rm -f "$adir/steam_appid.txt"
+        msg "  removed $adir/steam_appid.txt"
+      fi
+    done < <(sed -n 's/^file=//p' "$state")
+  fi
+  rm -f "$state"
+  msg "goldberg removed — originals restored"
+}
+
+steamemu_info() {
+  local name=$1
+  local state; state="$(game_dir "$name")/steamemu.state"
+  if [[ -f "$state" ]]; then
+    msg "Goldberg state for $name:"
+    msg "  version: $(state_get "$state" version)"
+    msg "  appid:   $(state_get "$state" appid)"
+    local f
+    while IFS= read -r f; do [[ -n "$f" ]] && echo "  file: $f"; done < <(sed -n 's/^file=//p' "$state")
+  else
+    msg "goldberg not installed for $name — winegame steamemu $name [--appid N]"
+  fi
+}
+
 cmd_wine() {
   local name="${1:-}"; shift || true
   require_game "$name"
@@ -405,7 +847,7 @@ cmd_remove() {
 cmd_doctor() {
   msg "winegame $VERSION — prefix root: $PREFIX_ROOT"
   local ok=1
-  for t in wine wineboot winecfg winepath winetricks; do
+  for t in wine wineboot winecfg winepath winetricks curl; do
     if command -v "$t" >/dev/null; then
       local v; v="$("$t" --version 2>/dev/null | head -1 || true)"
       msg "  $t: ${v:-found}"
@@ -415,6 +857,8 @@ cmd_doctor() {
   done
   if command -v gamemoderun >/dev/null 2>&1; then msg "  gamemode: found"
   else warn "  gamemode: NOT FOUND (optional — apt install gamemode)"; fi
+  if ldconfig -p 2>/dev/null | grep -q libvulkan; then msg "  vulkan: found (DXVK ready)"
+  else warn "  vulkan: NOT FOUND — DXVK needs it (apt install mesa-vulkan-drivers or nvidia-driver)"; fi
   if command -v rsync >/dev/null 2>&1; then msg "  rsync: found (fast installs)"
   else warn "  rsync: NOT FOUND (installs fall back to cp)"; fi
   local n=0
@@ -758,6 +1202,10 @@ ${C_B}commands:${C_X}
   doctor                      check wine/winetricks tooling
   doctor fix [name]           install WineHQ wine + right VA-API driver (fixes movie deadlock)
   doctor <name>               scan a game for missing runtimes, offer winetricks fixes
+  dxvk <name> [--dx11]        install DXVK (d3d8/9/10/11) + vkd3d-proton (d3d12) → Vulkan;
+                              --remove uninstalls, --info shows state
+  steamemu <name> [--appid N] replace steam_api*.dll with the Goldberg emulator
+                              (originals backed up; --remove restores)
 
 ${C_B}layout:${C_X}  $PREFIX_ROOT/<name>/{prefix,game,env,logs}
 ${C_B}config:${C_X}  set WINE_GAMES_DIR to relocate prefixes
@@ -779,7 +1227,7 @@ main() {
         *) if [[ -n "${2:-}" ]]; then game_doctor "$2"; else cmd_doctor; fi ;;
       esac
       ;;
-    new|install|run|cfg|setver|tricks|list|remove|override|env|shell|log|wine) "cmd_$1" "${@:2}" ;;
+    new|install|run|cfg|setver|tricks|list|remove|override|env|shell|log|wine|dxvk|steamemu) "cmd_$1" "${@:2}" ;;
     *) die "unknown command '$1' (see: winegame --help)" ;;
   esac
 }
