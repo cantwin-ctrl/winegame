@@ -18,7 +18,7 @@
 #   winegame remove <name> [-y]            delete a prefix
 #   winegame doctor [--tools]             check tooling (wine, vulkan, GPU, games)
 #   winegame doctor --game <name>         scan a game: runtimes, 3D/2D, DXVK advice
-#   winegame doctor --fix [name]          install WineHQ wine + right VA-API driver
+#   winegame doctor --fix [name]          auto-fix everything: tools, vulkan, wine, per-game env
 #   winegame dxvk <name> [--dx11]          install DXVK + vkd3d-proton into a prefix
 #   winegame dxvk <name> --remove|--info   uninstall / show DXVK state
 #   winegame steamemu <name> [--appid N]   replace steam_api*.dll with Goldberg emulator
@@ -1002,6 +1002,37 @@ vaapi_driver() {
 # decode in one pass (tested: wine-11.15 staging + LIBVA_DRIVER_NAME=iHD).
 cmd_doctor_fix() {
   local only="${1:-}"
+  # --- missing system packages (tools + vulkan), one apt command ---
+  local -a apt_pkgs=()
+  local pkg
+  for pkg in winetricks curl p7zip-full zstd gamemode rsync binutils; do
+    case "$pkg" in
+      p7zip-full) command -v 7z >/dev/null 2>&1 && continue ;;
+      zstd)       command -v zstd >/dev/null 2>&1 && continue ;;
+      gamemode)   command -v gamemoderun >/dev/null 2>&1 && continue ;;
+      binutils)   command -v objdump >/dev/null 2>&1 && continue ;;
+      *)          command -v "$pkg" >/dev/null 2>&1 && continue ;;
+    esac
+    apt_pkgs+=("$pkg")
+  done
+  if ! vulkan_present; then
+    case "$(gpu_vendor)" in
+      nvidia) apt_pkgs+=("nvidia-driver") ;;
+      *)      apt_pkgs+=("mesa-vulkan-drivers") ;;
+    esac
+  fi
+  if [[ ${#apt_pkgs[@]} -gt 0 ]]; then
+    mapfile -t apt_pkgs < <(printf '%s\n' "${apt_pkgs[@]}" | sort -u)
+    msg "missing packages: ${apt_pkgs[*]}"
+    local ans=n
+    if [[ -t 0 ]]; then read -rp "run: sudo apt install ${apt_pkgs[*]} [y/N] " ans; fi
+    if [[ "$ans" == y || "$ans" == Y ]]; then
+      sudo apt install -y "${apt_pkgs[@]}" || warn "apt install failed — run it manually"
+    else
+      warn "skipped — sudo apt install ${apt_pkgs[*]}"
+    fi
+  fi
+
   local state; state="$(wine_build_state)"
   case "$state" in
     bad)
@@ -1056,7 +1087,25 @@ EOF
   else
     warn "no VA-API driver for this GPU — skipping driver env (software decode via gstreamer1.0-libav:i386)"
   fi
-  msg "done — run 'winegame doctor' to verify"
+
+  # --- per-game env fixes: WINEARCH mismatch + stale GST override ---
+  local name env_arch reg_arch
+  for name in $(cmd_list_names); do
+    [[ -n "$only" && "$name" != "$only" ]] && continue
+    env_arch="$(get_env_val "$name" WINEARCH)"
+    reg_arch="$(grep -m1 '^#arch=' "$(prefix_dir "$name")/system.reg" 2>/dev/null | cut -d= -f2 || true)"
+    if [[ -n "$env_arch" && -n "$reg_arch" && "$env_arch" != "$reg_arch" ]]; then
+      msg "  $name: fixing WINEARCH $env_arch → $reg_arch"
+      set_env "$name" WINEARCH "$reg_arch"
+    fi
+    if grep -qs '^GST_PLUGIN_FEATURE_RANK=' "$(env_file "$name")" 2>/dev/null; then
+      msg "  $name: dropping GST_PLUGIN_FEATURE_RANK (VA-API works with winehq + iHD)"
+      del_env "$name" GST_PLUGIN_FEATURE_RANK
+    fi
+  done
+  msg ""
+  msg "re-checking..."
+  cmd_doctor
 }
 
 # DLLs wine ships as builtins / standard system libs — not worth flagging
@@ -1309,7 +1358,8 @@ ${C_B}commands:${C_X}
   remove <name> [-y]          delete a prefix (asks unless -y)
   doctor [--tools]            check tooling: wine, winetricks, vulkan, GPU, games
   doctor --game <name>        scan a game: missing runtimes, 3D/2D render, DXVK advice
-  doctor --fix [name]         install WineHQ wine + right VA-API driver (fixes movie deadlock)
+  doctor --fix [name]         auto-fix: missing tools, vulkan, wine build, VA-API,
+                              per-game WINEARCH/GST (asks before sudo)
   dxvk <name> [--dx11]        install DXVK (d3d8/9/10/11) + vkd3d-proton (d3d12) → Vulkan;
                               --remove uninstalls, --info shows state
   steamemu <name> [--appid N] replace steam_api*.dll with the Goldberg emulator
