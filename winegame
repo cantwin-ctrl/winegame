@@ -1522,7 +1522,7 @@ ${C_B}commands:${C_X}
   remove <name> [-y]          delete a prefix (asks unless -y)
   doctor [--tools]            check tooling: wine, winetricks, vulkan, GPU, games
   doctor --game <name>        scan a game: missing runtimes, 3D/2D render, DXVK advice
-  doctor -t <name>            engine/type report: NW.js, KiriKiri, Siglus, Unity...
+  doctor -t <name>            engine/type report: 20+ engines, packer, MSVC runtime
   doctor --fix [name]         auto-fix: missing tools, vulkan, wine build, VA-API,
                               per-game WINEARCH/GST (asks before sudo)
   dxvk <name> [--dx11]        install DXVK (d3d8/9/10/11) + vkd3d-proton (d3d12) → Vulkan;
