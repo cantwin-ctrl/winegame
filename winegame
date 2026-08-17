@@ -504,6 +504,70 @@ exe_packer() { # exe → packer name(s) or ""
   echo "${s:-}"
 }
 
+# PE Rich header → MSVC toolchain (XORed build metadata between DOS stub and PE sig)
+# "DanS" + (composedID,count)* + "Rich" + XOR-key; prodID = composedID >> 16.
+# Some binaries pad zero dwords after DanS — so decode every dword and take the
+# max sane prodID instead of assuming strict (comp,count) alignment.
+rich_toolchain() { # exe → "VS20xx (cl x.y)" or ""
+  local f=$1
+  command -v od >/dev/null 2>&1 || return 0
+  local rich_off
+  rich_off="$(grep -abo 'Rich' "$f" 2>/dev/null | head -1 | cut -d: -f1)"
+  [[ -n "$rich_off" ]] || return 0
+  local n=$((rich_off+8))
+  [[ $n -gt 16384 ]] && n=16384
+  local hex
+  hex="$(od -An -v -tx1 -N "$n" "$f" 2>/dev/null | tr -d ' \n')"
+  # XOR key = 4 bytes after "Rich" (LE)
+  local b0=$((rich_off*2+8)) key
+  key=$((16#${hex:$((b0+6)):2}${hex:$((b0+4)):2}${hex:$((b0+2)):2}${hex:$b0:2}))
+  # scan backwards from Rich for the dword that decodes to "DanS" (0x536E6144)
+  local off danS=-1 dw val dec
+  for ((off=rich_off-4; off>=0; off-=4)); do
+    b0=$((off*2))
+    dw="${hex:$((b0+6)):2}${hex:$((b0+4)):2}${hex:$((b0+2)):2}${hex:$b0:2}"
+    val=$((16#$dw))
+    dec=$((val ^ key))
+    if [[ $dec -eq $((16#536E6144)) ]]; then danS=$off; break; fi
+  done
+  [[ $danS -ge 0 ]] || return 0
+  # decode every dword in the block; prodID = high word, keep the max sane one
+  local pos best=0 prod
+  for ((pos=danS+4; pos+4<=rich_off; pos+=4)); do
+    b0=$((pos*2))
+    dw="${hex:$((b0+6)):2}${hex:$((b0+4)):2}${hex:$((b0+2)):2}${hex:$b0:2}"
+    val=$((16#$dw)); prod=$(( (val ^ key) >> 16 ))
+    [[ $prod -ge 1 && $prod -le 255 && $prod -gt $best ]] && best=$prod
+  done
+  case $best in
+    0) return 0 ;;
+    16|17|18) echo "MSVC 7.x (VS2002/2003)" ;;
+    19|20|21) echo "MSVC 8.0 (VS2005)" ;;
+    22|23|24) echo "MSVC 8.1 (VS2005 SP1)" ;;
+    25|26|27) echo "MSVC 9.0 (VS2008)" ;;
+    28|29|30) echo "MSVC 10.0 (VS2010)" ;;
+    40|41|42) echo "MSVC 11.0 (VS2012)" ;;
+    47|48|49|50) echo "MSVC 12.0 (VS2013)" ;;
+    51|52|53|54) echo "MSVC 14.0 (VS2015)" ;;
+    55|56|57|58) echo "MSVC 14.1 (VS2017)" ;;
+    60|61|62|63) echo "MSVC 14.1 (VS2017 15.4+)" ;;
+    64|65|66|67) echo "MSVC 14.1 (VS2017 15.7+)" ;;
+    68|69|70|71) echo "MSVC 14.1 (VS2017 15.9+)" ;;
+    72|73|74|75) echo "MSVC 14.1 (VS2017 latest)" ;;
+    76|77|78|79) echo "MSVC 14.2 (VS2019)" ;;
+    80|81|82|83) echo "MSVC 14.2 (VS2019 16.8+)" ;;
+    84|85|86|87) echo "MSVC 14.2 (VS2019 16.11+)" ;;
+    88|89|90|91) echo "MSVC 14.3 (VS2022)" ;;
+    92|93|94|95) echo "MSVC 14.3 (VS2022 17.4+)" ;;
+    96|97|98|99|100|101|102|103|104|105|106|107|108|109|110|111) echo "MSVC 14.3x (VS2022 17.5+)" ;;
+    112|113|114|115|116|117|118|119|120|121|122|123|124|125|126|127) echo "MSVC 14.3x (VS2022 17.7+)" ;;
+    128|129|130|131|132|133|134|135|136|137|138|139|140|141|142|143) echo "MSVC 14.4x (VS2022 17.8+)" ;;
+    144|145|146|147|148|149|150|151|152|153|154|155|156|157|158|159) echo "MSVC 14.4x (VS2022 17.9+/latest)" ;;
+    160|161|162|163|164|165|166|167|168|169|170|171|172|173|174|175|176|177|178|179|180|181|182|183|184|185|186|187|188|189|190|191) echo "MSVC 14.4x+ (VS2022 17.11+/bleeding)" ;;
+    *) echo "MSVC toolchain (prodID $best)" ;;
+  esac
+}
+
 engine_hint() { # engine → advice
   case "$1" in
     *KiriKiri*|*Siglus*|*NScripter*|*Wolf*|*Tyrano*|*Flash*) echo "2D VN — DXVK unnecessary; movies need VA-API (doctor --fix sorts it)" ;;
@@ -539,6 +603,8 @@ game_type() {
     msg "  exe:    $(basename "$exe") (${arch:-unknown arch})"
     local pkr; pkr="$(exe_packer "$exe")"
     [[ -n "$pkr" ]] && msg "  packer: $pkr — import scan may be unreliable"
+    local rich; rich="$(rich_toolchain "$exe")"
+    [[ -n "$rich" ]] && msg "  toolchain: $rich (PE rich header)"
   fi
   local -A d3d=()
   local -A rt=()
