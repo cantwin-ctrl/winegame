@@ -18,6 +18,7 @@
 #   winegame remove <name> [-y]            delete a prefix
 #   winegame doctor [--tools]             check tooling (wine, vulkan, GPU, games)
 #   winegame doctor --game <name>         scan a game: runtimes, 3D/2D, DXVK advice
+#   winegame doctor -t <name>             engine/type report: NW.js, KiriKiri, Unity...
 #   winegame doctor --fix [name]          auto-fix everything: tools, vulkan, wine, per-game env
 #   winegame dxvk <name> [--dx11]          install DXVK + vkd3d-proton into a prefix
 #   winegame dxvk <name> --remove|--info   uninstall / show DXVK state
@@ -432,6 +433,88 @@ del_overrides() { # name dll... → drop those keys from WINEDLLOVERRIDES
 state_get() { # state-file, key → value
   local f=$1 k=$2
   if [[ -f "$f" ]]; then sed -n "s/^$k=//p" "$f" | head -1; fi
+}
+
+# game engine detection from directory signatures
+detect_engine() { # gamedir → engine name
+  local gdir=$1
+  if [[ -f "$gdir/nw.dll" || -f "$gdir/nwjs.dll" ]]; then
+    if [[ -f "$gdir/package.json" ]] && grep -qi '"main"[[:space:]]*:[[:space:]]*"index.html"' "$gdir/package.json" 2>/dev/null && [[ -d "$gdir/www" ]]; then
+      echo "RPG Maker MV/MZ (NW.js)"
+    else
+      echo "NW.js (Chromium)"
+    fi
+    return
+  fi
+  if find "$gdir" -maxdepth 2 -iname '*.xp3' -print -quit 2>/dev/null | grep -q .; then echo "KiriKiri/TVP (VN engine, .xp3 archives)"; return; fi
+  if find "$gdir" -maxdepth 2 -iname '*.iga' -print -quit 2>/dev/null | grep -q .; then echo "Siglus (VN engine, .iga archives)"; return; fi
+  if [[ -f "$gdir/UnityPlayer.dll" || -d "$gdir/Data/Managed" || -d "$gdir/MonoBleedingEdge" ]]; then echo "Unity"; return; fi
+  if [[ -d "$gdir/renpy" ]]; then echo "Ren'Py"; return; fi
+  if [[ -f "$gdir/Game.rgss3a" ]]; then echo "RPG Maker VX Ace"; return; fi
+  if [[ -f "$gdir/Game.rgss2a" ]]; then echo "RPG Maker VX"; return; fi
+  if [[ -f "$gdir/Game.rgssad" ]]; then echo "RPG Maker XP"; return; fi
+  if [[ -f "$gdir/data.win" ]]; then echo "GameMaker"; return; fi
+  if find "$gdir" -maxdepth 2 -iname '*.pck' -print -quit 2>/dev/null | grep -q .; then echo "Godot"; return; fi
+  if find "$gdir" -maxdepth 3 -iname '*.pak' -print -quit 2>/dev/null | grep -q .; then echo "Unreal Engine"; return; fi
+  echo "unknown"
+}
+
+engine_hint() { # engine → advice
+  case "$1" in
+    *KiriKiri*) echo "VN — 2D, DXVK unnecessary; movies need VA-API (doctor --fix sorts it)" ;;
+    *Siglus*)   echo "VN — 2D, DXVK unnecessary" ;;
+    *NW.js*|*"RPG Maker MV"*) echo "Chromium-based — DXVK works but spams dxgi composition errors; --disable-gpu-compositing silences" ;;
+    Unity|Godot) echo "3D-capable — DXVK recommended" ;;
+    Ren*)       echo "2D — DXVK unnecessary" ;;
+    *)          echo "generic — check render type below" ;;
+  esac
+}
+
+# quick engine/type report for one game
+game_type() {
+  local name="${1:-}"
+  require_game "$name"
+  local gdir; gdir="$(game_dir "$name")/game"
+  msg "type report for $name:"
+  if [[ -d "$gdir" ]]; then
+    local eng; eng="$(detect_engine "$gdir")"
+    msg "  engine: $eng"
+    msg "  hint:   $(engine_hint "$eng")"
+  else
+    msg "  engine: no game files yet (winegame install $name <folder>)"
+  fi
+  local exe
+  exe="$(find "$gdir" -maxdepth 2 -iname '*.exe' -print -quit 2>/dev/null)"
+  if [[ -n "$exe" ]]; then
+    local arch; arch="$(file -b "$exe" 2>/dev/null | grep -oE 'PE32\+?' | head -1)"
+    msg "  exe:    $(basename "$exe") (${arch:-unknown arch})"
+  fi
+  local -A d3d=()
+  local e dll
+  if command -v objdump >/dev/null 2>&1; then
+    while IFS= read -r -d '' e; do
+      while read -r dll; do
+        [[ -n "$dll" ]] || continue
+        dll="$(tr 'A-Z' 'a-z' <<< "$dll")"
+        case "$dll" in
+          d3d8.dll) d3d[d3d8]=1 ;; d3d9.dll) d3d[d3d9]=1 ;;
+          d3d10.dll|d3d10_1.dll|d3d10core.dll) d3d[d3d10]=1 ;;
+          d3d11.dll|dxgi.dll) d3d[d3d11]=1 ;; d3d12.dll) d3d[d3d12]=1 ;;
+        esac
+      done < <(objdump -p "$e" 2>/dev/null | grep -i 'DLL Name:' | awk '{print $3}')
+    done < <(find "$gdir" -maxdepth 2 -iname '*.exe' -print0 2>/dev/null || true)
+    local lvl="" l
+    for l in d3d12 d3d11 d3d10 d3d9 d3d8; do [[ -n "${d3d[$l]:-}" ]] && { lvl=$l; break; }; done
+    if [[ -n "$lvl" ]]; then
+      msg "  render: 3D (Direct3D ${lvl#d3d})"
+      if [[ -f "$(game_dir "$name")/dxvk.state" ]]; then msg "  dxvk:   installed — good match"
+      else msg "  dxvk:   not installed — winegame dxvk $name"; fi
+    else
+      msg "  render: 2D (no Direct3D imports)"
+      if [[ -f "$(game_dir "$name")/dxvk.state" ]]; then msg "  dxvk:   installed (not needed, but harmless)"; fi
+    fi
+  fi
+  return 0
 }
 
 # vulkan loader present? (ldconfig may be outside PATH — probe known dirs too)
@@ -1232,6 +1315,7 @@ game_doctor() {
   done
 
   # render advice: 3D game → DXVK, 2D → skip it
+  msg "  engine: $(detect_engine "$gdir")"
   local -a levels=(d3d12 d3d11 d3d10 d3d9 d3d8)
   local lvl="" l
   for l in "${levels[@]}"; do [[ -n "${d3d[$l]:-}" ]] && { lvl=$l; break; }; done
@@ -1378,6 +1462,7 @@ ${C_B}commands:${C_X}
   remove <name> [-y]          delete a prefix (asks unless -y)
   doctor [--tools]            check tooling: wine, winetricks, vulkan, GPU, games
   doctor --game <name>        scan a game: missing runtimes, 3D/2D render, DXVK advice
+  doctor -t <name>            engine/type report: NW.js, KiriKiri, Siglus, Unity...
   doctor --fix [name]         auto-fix: missing tools, vulkan, wine build, VA-API,
                               per-game WINEARCH/GST (asks before sudo)
   dxvk <name> [--dx11]        install DXVK (d3d8/9/10/11) + vkd3d-proton (d3d12) → Vulkan;
@@ -1402,9 +1487,10 @@ main() {
     doctor)
       case "${2:-}" in
         --game|--scan)   game_doctor "${3:-}" ;;
+        -t|--type)       game_type "${3:-}" ;;
         --fix)           cmd_doctor_fix "${3:-}" ;;
         --tools|--system) cmd_doctor ;;
-        -h|--help)       echo "doctor usage: --tools (default) | --game <name> | --fix [name]" ;;
+        -h|--help)       echo "doctor usage: --tools (default) | --game <name> | -t/--type <name> | --fix [name]" ;;
         fix)             cmd_doctor_fix "${3:-}" ;;   # legacy alias
         "")              cmd_doctor ;;
         *)               game_doctor "$2" ;;          # legacy alias: doctor <name>
