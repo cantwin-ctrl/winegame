@@ -435,9 +435,10 @@ state_get() { # state-file, key → value
   if [[ -f "$f" ]]; then sed -n "s/^$k=//p" "$f" | head -1; fi
 }
 
-# game engine detection from directory signatures
+# game engine detection from directory signatures (SteamDB-style file rules)
 detect_engine() { # gamedir → engine name
   local gdir=$1
+  # NW.js / Electron / RPG Maker MV/MZ (nwjs-based)
   if [[ -f "$gdir/nw.dll" || -f "$gdir/nwjs.dll" ]]; then
     if [[ -f "$gdir/package.json" ]] && grep -qi '"main"[[:space:]]*:[[:space:]]*"index.html"' "$gdir/package.json" 2>/dev/null && [[ -d "$gdir/www" ]]; then
       echo "RPG Maker MV/MZ (NW.js)"
@@ -446,27 +447,75 @@ detect_engine() { # gamedir → engine name
     fi
     return
   fi
-  if find "$gdir" -maxdepth 2 -iname '*.xp3' -print -quit 2>/dev/null | grep -q .; then echo "KiriKiri/TVP (VN engine, .xp3 archives)"; return; fi
+  # KiriKiri/TVP — root data.xp3 is the canonical marker (SteamDB), any .xp3 as fallback
+  if [[ -f "$gdir/data.xp3" || -f "$gdir/krflash.dll" ]] || find "$gdir" -maxdepth 2 -iname '*.xp3' -print -quit 2>/dev/null | grep -q .; then
+    echo "KiriKiri/TVP (VN engine, .xp3 archives)"; return
+  fi
+  # Siglus (Innocent Grey)
   if find "$gdir" -maxdepth 2 -iname '*.iga' -print -quit 2>/dev/null | grep -q .; then echo "Siglus (VN engine, .iga archives)"; return; fi
-  if [[ -f "$gdir/UnityPlayer.dll" || -d "$gdir/Data/Managed" || -d "$gdir/MonoBleedingEdge" ]]; then echo "Unity"; return; fi
-  if [[ -d "$gdir/renpy" ]]; then echo "Ren'Py"; return; fi
+  # RPG Maker — versioned runtime dll is the strongest signal
+  local rgss
+  rgss="$(find "$gdir" -maxdepth 2 -iname 'rgss*.dll' -print -quit 2>/dev/null)"
+  if [[ -n "$rgss" ]]; then
+    case "$(basename "$rgss" | tr 'A-Z' 'a-z')" in
+      rgss104e.dll) echo "RPG Maker 2000"; return ;;
+      rgss102e.dll) echo "RPG Maker 2003"; return ;;
+      rgss202e.dll) echo "RPG Maker XP"; return ;;
+      rgss301.dll)  echo "RPG Maker VX"; return ;;
+      *) echo "RPG Maker ($(basename "$rgss"))"; return ;;
+    esac
+  fi
   if [[ -f "$gdir/Game.rgss3a" ]]; then echo "RPG Maker VX Ace"; return; fi
-  if [[ -f "$gdir/Game.rgss2a" ]]; then echo "RPG Maker VX"; return; fi
+  if [[ -f "$gdir/Game.rgss2a" || -f "$gdir/Game.rvproj2" ]]; then echo "RPG Maker VX"; return; fi
   if [[ -f "$gdir/Game.rgssad" ]]; then echo "RPG Maker XP"; return; fi
+  if find "$gdir" -maxdepth 2 -path '*/js/*' \( -iname 'rpg_core.js' -o -iname 'rmmz_core.js' \) -print -quit 2>/dev/null | grep -q .; then echo "RPG Maker MV/MZ"; return; fi
+  # Ren'Py
+  if [[ -d "$gdir/renpy" ]] || find "$gdir" -maxdepth 2 \( -iname '*.rpyb' -o -iname '*.rpa' \) -print -quit 2>/dev/null | grep -q .; then echo "Ren'Py"; return; fi
+  # NScripter / ONScripter
+  if [[ -f "$gdir/nscript.dat" || -f "$gdir/arc.nsa" ]]; then echo "NScripter/ONScripter (VN engine)"; return; fi
+  # Wolf RPG Editor
+  if find "$gdir" -maxdepth 2 -iname 'data.wolf' -print -quit 2>/dev/null | grep -q .; then echo "Wolf RPG Editor"; return; fi
+  # TyranoBuilder (HTML5 VN)
+  if find "$gdir" -maxdepth 2 -iname 'tyrano.js' -print -quit 2>/dev/null | grep -q .; then echo "TyranoBuilder (VN engine)"; return; fi
+  # Unity
+  if [[ -f "$gdir/UnityPlayer.dll" || -d "$gdir/Data/Managed" || -d "$gdir/MonoBleedingEdge" || -f "$gdir/globalgamemanagers" || -f "$gdir/GameAssembly.dll" ]]; then echo "Unity"; return; fi
+  # Source / Source 2
+  if find "$gdir" -maxdepth 2 \( -iname 'vphysics.dll' -o -iname 'bsppack.dll' -o -iname 'vgui.dll' \) -print -quit 2>/dev/null | grep -q .; then echo "Source Engine"; return; fi
+  if [[ -f "$gdir/gameinfo.gi" ]]; then echo "Source 2"; return; fi
+  # GameMaker
   if [[ -f "$gdir/data.win" ]]; then echo "GameMaker"; return; fi
-  if find "$gdir" -maxdepth 2 -iname '*.pck' -print -quit 2>/dev/null | grep -q .; then echo "Godot"; return; fi
-  if find "$gdir" -maxdepth 3 -iname '*.pak' -print -quit 2>/dev/null | grep -q .; then echo "Unreal Engine"; return; fi
+  # Godot
+  if [[ -f "$gdir/project.godot" || -f "$gdir/GodotSharp.dll" ]] || find "$gdir" -maxdepth 2 -iname '*.pck' -print -quit 2>/dev/null | grep -q .; then echo "Godot"; return; fi
+  # LÖVE (Lua)
+  if [[ -f "$gdir/love.dll" ]]; then echo "LÖVE (Lua)"; return; fi
+  # Clickteam Fusion
+  if [[ -f "$gdir/mmfs2.dll" ]]; then echo "Clickteam Fusion"; return; fi
+  # Adobe Flash
+  if find "$gdir" -maxdepth 2 -iname '*.swf' -print -quit 2>/dev/null | grep -q .; then echo "Adobe Flash (.swf)"; return; fi
+  # Unreal — .pak/.upk loose archives or the Engine/ tree
+  if find "$gdir" -maxdepth 3 \( -iname '*.pak' -o -iname '*.upk' \) -print -quit 2>/dev/null | grep -q . || [[ -d "$gdir/Engine/Binaries" ]]; then echo "Unreal Engine"; return; fi
   echo "unknown"
+}
+
+# packer detection from the exe's own bytes (first 2MB — markers live up front)
+exe_packer() { # exe → packer name(s) or ""
+  local s
+  s="$(head -c 2M "$1" 2>/dev/null | strings -n 5 2>/dev/null | grep -iE 'UPX0|UPX1|UPX!|VMProtect|Themida|Enigma protector|MPRESS|ASPack|PECompact|Obsidium' | tr '\n' ' ')"
+  echo "${s:-}"
 }
 
 engine_hint() { # engine → advice
   case "$1" in
-    *KiriKiri*) echo "VN — 2D, DXVK unnecessary; movies need VA-API (doctor --fix sorts it)" ;;
-    *Siglus*)   echo "VN — 2D, DXVK unnecessary" ;;
-    *NW.js*|*"RPG Maker MV"*) echo "Chromium-based — DXVK works but spams dxgi composition errors; --disable-gpu-compositing silences" ;;
-    Unity|Godot) echo "3D-capable — DXVK recommended" ;;
-    Ren*)       echo "2D — DXVK unnecessary" ;;
-    *)          echo "generic — check render type below" ;;
+    *KiriKiri*|*Siglus*|*NScripter*|*Wolf*|*Tyrano*|*Flash*) echo "2D VN — DXVK unnecessary; movies need VA-API (doctor --fix sorts it)" ;;
+    *"RPG Maker"*) echo "2D RPG — DXVK unnecessary" ;;
+    *Ren*)          echo "2D — DXVK unnecessary" ;;
+    *LÖVE*)         echo "2D — DXVK unnecessary" ;;
+    *Clickteam*)    echo "2D — DXVK unnecessary" ;;
+    *NW.js*|*"RPG Maker MV"*|*"RPG Maker MZ"*) echo "Chromium-based — DXVK works but spams dxgi composition errors; --disable-gpu-compositing silences" ;;
+    Unity|Godot)    echo "3D-capable — DXVK recommended" ;;
+    *Source*)       echo "3D — DXVK recommended" ;;
+    *Unreal*)       echo "3D — DXVK recommended" ;;
+    *)              echo "generic — check render type below" ;;
   esac
 }
 
@@ -486,10 +535,13 @@ game_type() {
   local exe
   exe="$(find "$gdir" -maxdepth 2 -iname '*.exe' -print -quit 2>/dev/null)"
   if [[ -n "$exe" ]]; then
-    local arch; arch="$(file -b "$exe" 2>/dev/null | grep -oE 'PE32\+?' | head -1)"
+    local arch; arch="$(file -b "$exe" 2>/dev/null | grep -oE 'PE32\+?' | head -1 || true)"
     msg "  exe:    $(basename "$exe") (${arch:-unknown arch})"
+    local pkr; pkr="$(exe_packer "$exe")"
+    [[ -n "$pkr" ]] && msg "  packer: $pkr — import scan may be unreliable"
   fi
   local -A d3d=()
+  local -A rt=()
   local e dll
   if command -v objdump >/dev/null 2>&1; then
     while IFS= read -r -d '' e; do
@@ -500,9 +552,17 @@ game_type() {
           d3d8.dll) d3d[d3d8]=1 ;; d3d9.dll) d3d[d3d9]=1 ;;
           d3d10.dll|d3d10_1.dll|d3d10core.dll) d3d[d3d10]=1 ;;
           d3d11.dll|dxgi.dll) d3d[d3d11]=1 ;; d3d12.dll) d3d[d3d12]=1 ;;
+          msvcp140.dll|vcruntime140.dll|vcruntime140_1.dll) rt[msvc2015]=1 ;;
+          msvcp120.dll|msvcr120.dll) rt[msvc2013]=1 ;;
+          msvcp110.dll|msvcr110.dll) rt[msvc2012]=1 ;;
+          msvcp100.dll|msvcr100.dll) rt[msvc2010]=1 ;;
         esac
       done < <(objdump -p "$e" 2>/dev/null | grep -i 'DLL Name:' | awk '{print $3}')
     done < <(find "$gdir" -maxdepth 2 -iname '*.exe' -print0 2>/dev/null || true)
+    if [[ -n "${rt[msvc2015]:-}" ]]; then msg "  runtime: MSVC 2015+ (msvcp140)"
+    elif [[ -n "${rt[msvc2013]:-}" ]]; then msg "  runtime: MSVC 2013 (msvcp120)"
+    elif [[ -n "${rt[msvc2012]:-}" ]]; then msg "  runtime: MSVC 2012 (msvcp110)"
+    elif [[ -n "${rt[msvc2010]:-}" ]]; then msg "  runtime: MSVC 2010 (msvcp100)"; fi
     local lvl="" l
     for l in d3d12 d3d11 d3d10 d3d9 d3d8; do [[ -n "${d3d[$l]:-}" ]] && { lvl=$l; break; }; done
     if [[ -n "$lvl" ]]; then
