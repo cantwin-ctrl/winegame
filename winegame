@@ -33,7 +33,7 @@
 
 set -euo pipefail
 
-VERSION="1.3.0"
+VERSION="1.3.1"
 PREFIX_ROOT="${WINE_GAMES_DIR:-$HOME/.games}"
 COMMANDS=(new install run cfg setver tricks override env wine shell log list remove doctor dxvk steamemu)
 
@@ -486,12 +486,17 @@ dxvk_install() {
   local dll b
   for dll in "$dsrc"/x64/*.dll; do
     [[ -e "$dll" ]] || continue
+    # wine 10 ships builtins as real files in the prefix — back up before overwriting
+    [[ -f "$x64dir/$(basename "$dll")" && ! -f "$x64dir/$(basename "$dll").bak-dxvk" ]] \
+      && cp -f "$x64dir/$(basename "$dll")" "$x64dir/$(basename "$dll").bak-dxvk"
     cp -f "$dll" "$x64dir/"
     b="$(basename "$dll" .dll)"
     [[ " ${over[*]:-} " == *" $b "* ]] || over+=("$b")
   done
   for dll in "$dsrc"/x32/*.dll; do
     [[ -e "$dll" ]] || continue
+    [[ -f "$x86dir/$(basename "$dll")" && ! -f "$x86dir/$(basename "$dll").bak-dxvk" ]] \
+      && cp -f "$x86dir/$(basename "$dll")" "$x86dir/$(basename "$dll").bak-dxvk"
     cp -f "$dll" "$x86dir/"
     b="$(basename "$dll" .dll)"
     [[ " ${over[*]:-} " == *" $b "* ]] || over+=("$b")
@@ -535,16 +540,31 @@ dxvk_remove() {
   local -a dl=()
   local b d
   IFS=',' read -ra dl <<< "$over"
+  local restored=0
   for b in "${dl[@]}"; do
     for d in "${dirs[@]}"; do
       if [[ -f "$d/$b.dll" ]]; then
-        rm -f "$d/$b.dll"
-        msg "  removed $d/$b.dll"
+        if [[ -f "$d/$b.dll.bak-dxvk" ]]; then
+          mv -f "$d/$b.dll.bak-dxvk" "$d/$b.dll"
+          msg "  restored $d/$b.dll (wine builtin)"
+          restored=1
+        else
+          rm -f "$d/$b.dll"
+          msg "  removed $d/$b.dll (dxvk-only)"
+        fi
       fi
     done
   done
   del_overrides "$name" "${dl[@]}"
   rm -f "$state"
+  if [[ $restored -eq 0 ]]; then
+    # nothing was backed up (pre-backup install) — regenerate any missing wine builtins
+    msg "no backups found — regenerating wine builtins (wineboot -u)..."
+    require_wine
+    load_env "$name"
+    export WINEPREFIX="$(prefix_dir "$name")"
+    wineboot -u >/dev/null 2>&1 || warn "wineboot -u failed — run manually: winegame wine $name wineboot -u"
+  fi
   msg "DXVK removed — wine builtins restored"
 }
 
